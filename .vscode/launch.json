@@ -1,0 +1,14 @@
+{
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Spring Boot-SmartPaiApplication<SmartPAI>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "com.yizhaoqi.smartpai.SmartPaiApplication",
+            "projectName": "SmartPAI",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}
