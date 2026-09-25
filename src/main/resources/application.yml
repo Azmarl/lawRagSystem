@@ -131,6 +131,8 @@ usage-quota:
     admin-init-tokens: ${USAGE_QUOTA_EMBEDDING_ADMIN_INIT_TOKENS:100000} # 管理员初始 Embedding Token
 
 file:
+  upload:
+    sensitive-words: ${FILE_UPLOAD_SENSITIVE_WORDS:}
   parsing:
     chunk-size: 512
     overlap-size: 100
@@ -183,6 +185,17 @@ embedding:
     model: ${EMBEDDING_API_MODEL:text-embedding-v4}
     batch-size: ${EMBEDDING_BATCH_SIZE:10}
     dimension: ${EMBEDDING_DIMENSION:2048}
+
+# 阿里云百炼决策模型（预览版）。请将 model 填写为百炼控制台实际提供的模型 ID。
+aliyun:
+  decision:
+    api:
+      url: ${ALIYUN_DECISION_API_URL:https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone}
+      key: ${ALIYUN_DECISION_API_KEY:}
+      model: ${ALIYUN_DECISION_API_MODEL:decision-model-preview}
+      timeout-ms: ${ALIYUN_DECISION_TIMEOUT_MS:500}
+    routing:
+      confidence-threshold: ${ALIYUN_DECISION_CONFIDENCE_THRESHOLD:0.85}
 
 ai:
   prompt:

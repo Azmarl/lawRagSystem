@@ -73,6 +73,15 @@
       },
       "legalTermDensity": {
         "type": "float"
+      },
+      "documentType": {
+        "type": "keyword"
+      },
+      "parentBlockId": {
+        "type": "keyword"
+      },
+      "chunkPosition": {
+        "type": "integer"
       }
     }
   }

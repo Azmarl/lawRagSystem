@@ -44,6 +44,9 @@ public class EsDocument {
 
     /** 法律术语密度 */
     private Double legalTermDensity;
+    private String documentType;
+    private String parentBlockId;
+    private Integer chunkPosition;
 
     /**
      * 默认构造函数，用于Jackson反序列化
@@ -99,6 +102,20 @@ public class EsDocument {
         this.articleId = articleId;
         this.articleIdDensity = articleIdDensity;
         this.legalTermDensity = legalTermDensity;
+    }
+
+    public EsDocument(String id, String fileMd5, int chunkId, String content,
+                     Integer pageNumber, String anchorText, float[] vector, String modelVersion,
+                     String userId, String orgTag, boolean isPublic, String chunkLevel,
+                     String partName, String chapterName, String sectionName, String articleId,
+                     Double articleIdDensity, Double legalTermDensity, String documentType,
+                     String parentBlockId, Integer chunkPosition) {
+        this(id, fileMd5, chunkId, content, pageNumber, anchorText, vector, modelVersion,
+                userId, orgTag, isPublic, chunkLevel, partName, chapterName, sectionName,
+                articleId, articleIdDensity, legalTermDensity);
+        this.documentType = documentType;
+        this.parentBlockId = parentBlockId;
+        this.chunkPosition = chunkPosition;
     }
     
 

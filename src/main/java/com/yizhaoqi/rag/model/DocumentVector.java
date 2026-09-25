@@ -80,4 +80,10 @@ public class DocumentVector {
     /** 法律术语密度：法律术语命中数 / 总token数 */
     @Column(name = "legal_term_density")
     private Double legalTermDensity;
+
+    @Column(name = "parent_block_id", length = 128)
+    private String parentBlockId;
+
+    @Column(name = "chunk_position")
+    private Integer chunkPosition;
 }

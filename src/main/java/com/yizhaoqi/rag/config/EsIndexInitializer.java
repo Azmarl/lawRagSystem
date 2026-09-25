@@ -60,6 +60,7 @@ public class EsIndexInitializer implements CommandLineRunner {
             logger.info("正在初始化索引 'knowledge_base'... endpoint={}://{}:{}, username={}",
                     scheme, host, port, maskUsername(username));
             initializeIndex();
+                initializePrivateIndex();
         } catch (Exception exception) {
             // 特别处理连接关闭异常，尝试重新连接
             if (exception instanceof ConnectionClosedException || (exception.getCause() != null && exception.getCause() instanceof ConnectionClosedException)) {
@@ -215,6 +216,22 @@ public class EsIndexInitializer implements CommandLineRunner {
         );
         esClient.indices().create(createIndexRequest);
         logger.info("索引 'knowledge_base' 已创建");
+    }
+
+    private void initializePrivateIndex() throws Exception {
+        BooleanResponse existsResponse = esClient.indices().exists(
+                ExistsRequest.of(e -> e.index("knowledge_private")));
+        if (existsResponse.value()) {
+            return;
+        }
+        String mappingJson;
+        try (var inputStream = mappingResource.getInputStream()) {
+            mappingJson = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        esClient.indices().create(CreateIndexRequest.of(c -> c
+                .index("knowledge_private")
+                .withJson(new StringReader(mappingJson))));
+        logger.info("索引 'knowledge_private' 已创建");
     }
 
     private String buildDiagnosticMessage(Exception exception) {

@@ -36,6 +36,8 @@ public class ChunkDTO {
 
     /** 条文号密度 */
     private Double articleIdDensity;
+    private String parentBlockId;
+    private Integer chunkPosition;
 
     // ===== Builder =====
 
@@ -53,6 +55,8 @@ public class ChunkDTO {
         private int tokenCount;
         private Double legalTermDensity;
         private Double articleIdDensity;
+        private String parentBlockId;
+        private Integer chunkPosition;
 
         public Builder textContent(String textContent) {
             this.textContent = textContent;
@@ -99,6 +103,16 @@ public class ChunkDTO {
             return this;
         }
 
+        public Builder parentBlockId(String parentBlockId) {
+            this.parentBlockId = parentBlockId;
+            return this;
+        }
+
+        public Builder chunkPosition(Integer chunkPosition) {
+            this.chunkPosition = chunkPosition;
+            return this;
+        }
+
         public ChunkDTO build() {
             return new ChunkDTO(this);
         }
@@ -114,6 +128,8 @@ public class ChunkDTO {
         this.tokenCount = builder.tokenCount;
         this.legalTermDensity = builder.legalTermDensity;
         this.articleIdDensity = builder.articleIdDensity;
+        this.parentBlockId = builder.parentBlockId;
+        this.chunkPosition = builder.chunkPosition;
     }
 
     // ===== Getters =====
@@ -152,5 +168,13 @@ public class ChunkDTO {
 
     public Double getArticleIdDensity() {
         return articleIdDensity;
+    }
+
+    public String getParentBlockId() {
+        return parentBlockId;
+    }
+
+    public Integer getChunkPosition() {
+        return chunkPosition;
     }
 }

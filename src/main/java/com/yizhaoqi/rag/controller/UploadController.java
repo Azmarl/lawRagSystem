@@ -7,6 +7,7 @@ import com.yizhaoqi.rag.model.FileUpload;
 import com.yizhaoqi.rag.model.OrganizationTag;
 import com.yizhaoqi.rag.repository.FileUploadRepository;
 import com.yizhaoqi.rag.service.FileTypeValidationService;
+import com.yizhaoqi.rag.service.DocumentSafetyService;
 import com.yizhaoqi.rag.service.ParseService;
 import com.yizhaoqi.rag.service.UploadService;
 import com.yizhaoqi.rag.service.UserService;
@@ -51,6 +52,9 @@ public class UploadController {
 
     @Autowired
     private ParseService parseService;
+
+    @Autowired
+    private DocumentSafetyService documentSafetyService;
 
     public UploadController(UploadService uploadService, KafkaTemplate<String, Object> kafkaTemplate) {
         this.uploadService = uploadService;
@@ -354,6 +358,9 @@ public class UploadController {
                     .orElseThrow(() -> new RuntimeException("文件记录不存在"));
 
             ParseService.EmbeddingEstimate embeddingEstimate = null;
+            try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(request.fileMd5())) {
+                documentSafetyService.validate(mergedFileStream);
+            }
             try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(request.fileMd5())) {
                 embeddingEstimate = parseService.estimateEmbeddingUsage(mergedFileStream);
                 fileUpload.setEstimatedEmbeddingTokens(embeddingEstimate.estimatedTokens());

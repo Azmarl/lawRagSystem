@@ -92,7 +92,10 @@ public class VectorizationService {
                                 chunk.getSectionName(),
                                 chunk.getArticleId(),
                                 chunk.getArticleIdDensity(),
-                                chunk.getLegalTermDensity()
+                                chunk.getLegalTermDensity(),
+                                "private".equals(chunk.getChunkLevel()) ? "PRIVATE_LEGAL" : "STRUCTURED_LAW",
+                                chunk.getParentBlockId(),
+                                chunk.getChunkPosition()
                         );
                     })
                     .toList();
@@ -142,6 +145,8 @@ public class VectorizationService {
                     chunk.setArticleId(vector.getArticleId());
                     chunk.setArticleIdDensity(vector.getArticleIdDensity());
                     chunk.setLegalTermDensity(vector.getLegalTermDensity());
+                    chunk.setParentBlockId(vector.getParentBlockId());
+                    chunk.setChunkPosition(vector.getChunkPosition());
                     return chunk;
                 })
                 .toList();

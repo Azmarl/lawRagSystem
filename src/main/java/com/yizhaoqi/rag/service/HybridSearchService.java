@@ -5,6 +5,7 @@ import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import com.yizhaoqi.rag.client.EmbeddingClient;
+import com.yizhaoqi.rag.client.AliyunDecisionClient;
 import com.yizhaoqi.rag.chunker.LegalTermScorer;
 import com.yizhaoqi.rag.entity.EsDocument;
 import com.yizhaoqi.rag.entity.SearchResult;
@@ -16,6 +17,7 @@ import com.yizhaoqi.rag.repository.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -65,6 +67,12 @@ public class HybridSearchService {
     @Autowired
     private FileUploadRepository fileUploadRepository;
 
+    @Autowired
+    private AliyunDecisionClient aliyunDecisionClient;
+
+    @Value("${aliyun.decision.routing.confidence-threshold:0.85}")
+    private double decisionConfidenceThreshold;
+
     private final LegalTermScorer termScorer = new LegalTermScorer();
 
     /**
@@ -89,6 +97,8 @@ public class HybridSearchService {
             // ===== 2. 计算 Adaptive α（含精确条文查询补偿）=====
             LegalTermScorer.ArticleIdQueryInfo queryInfo = termScorer.analyzeQuery(query);
             double alpha = termScorer.computeAlpha(queryInfo);
+            SearchScope searchScope = resolveSearchScope(query, queryInfo);
+            String[] searchIndices = indicesFor(searchScope);
             logger.info("Adaptive α 计算: query='{}', articleIdDensity={:.4f}, legalTermDensity={:.4f}, α={:.4f}",
                     query, queryInfo.articleIdDensity(), queryInfo.legalTermDensity(), alpha);
 
@@ -98,7 +108,7 @@ public class HybridSearchService {
             // 如果向量生成失败，退化为纯 BM25
             if (queryVector == null) {
                 logger.warn("向量生成失败，退化为纯 BM25 搜索");
-                return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, topK);
+                return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, topK, searchIndices);
             }
 
             // ===== 4. 双路并发查询 =====
@@ -107,7 +117,7 @@ public class HybridSearchService {
             // 路径 A: BM25 倒排召回（异步）
             CompletableFuture<Map<String, HitScore>> bm25Future = CompletableFuture.supplyAsync(() -> {
                 try {
-                    return executeBm25Query(query, userDbId, userEffectiveTags, recallK, queryInfo);
+                    return executeBm25Query(query, userDbId, userEffectiveTags, recallK, queryInfo, searchIndices);
                 } catch (Exception e) {
                     logger.error("BM25 查询失败", e);
                     return Collections.emptyMap();
@@ -117,7 +127,7 @@ public class HybridSearchService {
             // 路径 B: KNN 向量召回（异步）
             CompletableFuture<Map<String, HitScore>> knnFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    return executeKnnQuery(queryVector, userDbId, userEffectiveTags, recallK);
+                    return executeKnnQuery(queryVector, userDbId, userEffectiveTags, recallK, searchIndices);
                 } catch (Exception e) {
                     logger.error("KNN 查询失败", e);
                     return Collections.emptyMap();
@@ -142,8 +152,10 @@ public class HybridSearchService {
             logger.error("带权限的双路搜索失败", e);
             try {
                 logger.info("尝试使用纯文本搜索作为后备方案");
+                LegalTermScorer.ArticleIdQueryInfo fallbackInfo = termScorer.analyzeQuery(query);
                 return textOnlySearchWithPermission(query, getUserDbId(userId),
-                        getUserEffectiveOrgTags(userId), topK);
+                    getUserEffectiveOrgTags(userId), topK,
+                    indicesFor(resolveSearchScope(query, fallbackInfo)));
             } catch (Exception fallbackError) {
                 logger.error("后备搜索也失败", fallbackError);
                 return Collections.emptyList();
@@ -157,14 +169,14 @@ public class HybridSearchService {
 
     private Map<String, HitScore> executeBm25Query(String query, String userDbId,
             List<String> userEffectiveTags, int recallK,
-            LegalTermScorer.ArticleIdQueryInfo queryInfo) throws Exception {
+            LegalTermScorer.ArticleIdQueryInfo queryInfo, String[] indices) throws Exception {
 
         // 展开 articleId：阿拉伯数字形式 → 同时包含中文数字形式（双向转换）
         List<String> expandedArticleIds = termScorer.expandArticleIds(queryInfo.matchedArticleIds());
         boolean hasArticleIds = !expandedArticleIds.isEmpty();
 
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index("knowledge_base");
+            s.index(Arrays.asList(indices));
             s.size(recallK);
 
             s.query(q -> q.bool(b -> {
@@ -244,12 +256,12 @@ public class HybridSearchService {
     // ========================
 
     private Map<String, HitScore> executeKnnQuery(List<Float> queryVector, String userDbId,
-            List<String> userEffectiveTags, int recallK) throws Exception {
+            List<String> userEffectiveTags, int recallK, String[] indices) throws Exception {
 
         int numCandidates = recallK * 2;
 
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index("knowledge_base");
+            s.index(Arrays.asList(indices));
             s.knn(kn -> kn
                     .field("vector")
                     .queryVector(queryVector)
@@ -462,12 +474,12 @@ public class HybridSearchService {
      * 仅使用文本匹配的带权限搜索方法。
      */
     private List<SearchResult> textOnlySearchWithPermission(String query, String userDbId,
-            List<String> userEffectiveTags, int topK) {
+            List<String> userEffectiveTags, int topK, String[] indices) {
         try {
             logger.debug("开始执行纯文本搜索，用户数据库ID: {}, 标签: {}", userDbId, userEffectiveTags);
 
             SearchResponse<EsDocument> response = esClient.search(s -> s
-                    .index("knowledge_base")
+                    .index(Arrays.asList(indices))
                     .query(q -> q
                             .bool(b -> b
                                     .must(m -> m
@@ -737,6 +749,48 @@ public class HybridSearchService {
     // ========================================
     // 内部数据结构
     // ========================================
+
+    private SearchScope resolveSearchScope(String query,
+            LegalTermScorer.ArticleIdQueryInfo queryInfo) {
+        AliyunDecisionClient.DecisionResult decision = aliyunDecisionClient.classify(query, "", List.of());
+        if (decision.available() && decision.confidence() >= decisionConfidenceThreshold) {
+            return switch (decision.category()) {
+                case "PUBLIC" -> SearchScope.PUBLIC;
+                case "PRIVATE" -> SearchScope.PRIVATE;
+                case "BOTH" -> SearchScope.BOTH;
+                default -> fallbackSearchScope(query, queryInfo);
+            };
+        }
+        return fallbackSearchScope(query, queryInfo);
+    }
+
+    private SearchScope fallbackSearchScope(String query,
+            LegalTermScorer.ArticleIdQueryInfo queryInfo) {
+        if (queryInfo != null && !queryInfo.matchedArticleIds().isEmpty()) {
+            return SearchScope.PUBLIC;
+        }
+        String normalized = query == null ? "" : query.toLowerCase(Locale.ROOT);
+        if (normalized.contains("我的") || normalized.contains("上传")
+                || normalized.contains("合同") || normalized.contains("诉状")
+                || normalized.contains("报告") || normalized.contains("材料")) {
+            return SearchScope.PRIVATE;
+        }
+        return SearchScope.BOTH;
+    }
+
+    private String[] indicesFor(SearchScope scope) {
+        return switch (scope) {
+            case PUBLIC -> new String[]{ElasticsearchService.PUBLIC_INDEX};
+            case PRIVATE -> new String[]{ElasticsearchService.PRIVATE_INDEX};
+            case BOTH -> new String[]{ElasticsearchService.PUBLIC_INDEX, ElasticsearchService.PRIVATE_INDEX};
+        };
+    }
+
+    private enum SearchScope {
+        PUBLIC,
+        PRIVATE,
+        BOTH
+    }
 
     /**
      * 单路查询命中的文档得分及元数据。

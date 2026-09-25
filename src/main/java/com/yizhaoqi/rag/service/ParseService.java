@@ -1,6 +1,7 @@
 package com.yizhaoqi.rag.service;
 
 import com.yizhaoqi.rag.chunker.ChunkDTO;
+import com.yizhaoqi.rag.chunker.PrivateDocumentChunker;
 import com.yizhaoqi.rag.chunker.TreeAwareChunker;
 import com.yizhaoqi.rag.model.DocumentVector;
 import com.yizhaoqi.rag.parser.LegalStructureParser;
@@ -63,6 +64,8 @@ public class ParseService {
 
     // ===== 新流水线组件 =====
     private final LegalStructureParser legalStructureParser = new LegalStructureParser();
+        private final PrivateDocumentChunker privateDocumentChunker =
+            new PrivateDocumentChunker(new com.yizhaoqi.rag.chunker.LegalTermScorer(), 512, 0.12);
 
     public ParseService() {
     }
@@ -104,6 +107,12 @@ public class ParseService {
 
             if (fullText.isBlank()) {
                 logger.warn("Tika 提取到空文本，fileMd5: {}", fileMd5);
+                return;
+            }
+
+            if (!isStructuredLegalText(fullText)) {
+                saveChildChunks(fileMd5, privateDocumentChunker.chunk(fullText), userId, orgTag, isPublic);
+                logger.info("通用私有文档语义分块解析和入库完成，fileMd5: {}", fileMd5);
                 return;
             }
 
@@ -152,6 +161,12 @@ public class ParseService {
             parser.parse(bufferedStream, handler, metadata, context);
 
             String fullText = handler.getFullText();
+            if (!isStructuredLegalText(fullText)) {
+                List<ChunkDTO> privateChunks = privateDocumentChunker.chunk(fullText);
+                long tokens = usageQuotaService.estimateEmbeddingTokens(
+                        privateChunks.stream().map(ChunkDTO::getTextContent).toList());
+                return new EmbeddingEstimate(tokens, privateChunks.size());
+            }
             LegalNode root = legalStructureParser.parse(fullText);
             List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
 
@@ -254,6 +269,8 @@ public class ParseService {
             vector.setArticleId(chunk.getArticleId());
             vector.setArticleIdDensity(chunk.getArticleIdDensity());
             vector.setLegalTermDensity(chunk.getLegalTermDensity());
+            vector.setParentBlockId(chunk.getParentBlockId());
+            vector.setChunkPosition(chunk.getChunkPosition());
 
             documentVectorRepository.save(vector);
         }
@@ -301,6 +318,11 @@ public class ParseService {
             // 拼接所有页的文本
             String fullText = String.join("\n", cleanedPageTexts);
 
+            if (!isStructuredLegalText(fullText)) {
+                saveChildChunks(fileMd5, privateDocumentChunker.chunk(fullText), userId, orgTag, isPublic);
+                return;
+            }
+
             // 新流水线：结构解析 → 树状分块
             LegalNode root = legalStructureParser.parse(fullText);
             List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
@@ -329,6 +351,13 @@ public class ParseService {
         try (PDDocument document = PDDocument.load(fileStream)) {
             List<String> cleanedPageTexts = extractCleanPdfPageTexts(document);
             String fullText = String.join("\n", cleanedPageTexts);
+
+            if (!isStructuredLegalText(fullText)) {
+                List<ChunkDTO> privateChunks = privateDocumentChunker.chunk(fullText);
+                long tokens = usageQuotaService.estimateEmbeddingTokens(
+                        privateChunks.stream().map(ChunkDTO::getTextContent).toList());
+                return new EmbeddingEstimate(tokens, privateChunks.size());
+            }
 
             LegalNode root = legalStructureParser.parse(fullText);
             List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
@@ -507,6 +536,21 @@ public class ParseService {
         byte[] header = stream.readNBytes(5);
         stream.reset();
         return header.length == 5 && "%PDF-".equals(new String(header, StandardCharsets.US_ASCII));
+    }
+
+    private boolean isStructuredLegalText(String text) {
+        int articleCount = 0;
+        java.util.regex.Matcher articleMatcher = java.util.regex.Pattern
+                .compile("(?m)^\\s*第[0-9零一二三四五六七八九十百千万]+条")
+                .matcher(text);
+        while (articleMatcher.find()) {
+            articleCount++;
+        }
+        boolean hasHierarchy = java.util.regex.Pattern
+                .compile("(?m)^\\s*(第[一二三四五六七八九十百千万]+编|第[一二三四五六七八九十百千万]+章|第[一二三四五六七八九十百千万]+节)")
+                .matcher(text)
+                .find();
+        return hasHierarchy || articleCount >= 3;
     }
 
     private String buildAnchorText(String chunk) {
