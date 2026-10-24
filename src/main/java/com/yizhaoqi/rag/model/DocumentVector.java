@@ -4,13 +4,14 @@ import jakarta.persistence.*;
 import lombok.Data;
 
 /**
- * 文档向量实体类
- * 用于存储文本分块和相关元数据
+ * 文档向量基类。
+ *
+ * <p>公开法典分块写入 {@code document_vectors}，私人案件分块写入
+ * {@code private_document_vectors}，通过 JPA 继承映射实现 MySQL 层面的物理隔离。</p>
  */
 @Data
-@Entity
-@Table(name = "document_vectors")
-public class DocumentVector {
+@MappedSuperclass
+public abstract class DocumentVector {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long vectorId;
@@ -86,4 +87,31 @@ public class DocumentVector {
 
     @Column(name = "chunk_position")
     private Integer chunkPosition;
+
+    /**
+     * 文档类型：STRUCTURED_LAW / PRIVATE_LEGAL。
+     * 与独立表一起构成双保险，避免历史数据迁移时误入公共索引。
+     */
+    @Column(name = "document_type", length = 32)
+    private String documentType;
+
+    /** 稳定块 ID（父块/子块唯一） */
+    @Column(name = "block_id", length = 128)
+    private String blockId;
+
+    /** PARENT（仅上下文）/ CHILD（参与检索） */
+    @Column(name = "chunk_role", length = 16)
+    private String chunkRole;
+
+    /** TEXT / TABLE / FIGURE */
+    @Column(name = "content_type", length = 16)
+    private String contentType;
+
+    /** 分块策略：TREE_AWARE / CASE_ELEMENT / CASE_STRUCTURE / CHAR_OVERLAP / LEGAL_FALLBACK */
+    @Column(name = "chunk_strategy", length = 32)
+    private String chunkStrategy;
+
+    /** 私人案件段落类型：PARTIES / CLAIMS / FACTS / EVIDENCE / JUDGMENT ... */
+    @Column(name = "case_section", length = 32)
+    private String caseSection;
 }

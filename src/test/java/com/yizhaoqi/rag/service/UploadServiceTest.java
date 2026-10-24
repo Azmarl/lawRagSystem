@@ -61,6 +61,14 @@ class UploadServiceTest {
         ReflectionTestUtils.setField(uploadService, "fileUploadRepository", fileUploadRepository);
         ReflectionTestUtils.setField(uploadService, "chunkInfoRepository", chunkInfoRepository);
         ReflectionTestUtils.setField(uploadService, "minioConfig", minioConfig);
+
+        DocumentStorageService storageService = new DocumentStorageService();
+        ReflectionTestUtils.setField(storageService, "minioClient", minioClient);
+        ReflectionTestUtils.setField(storageService, "minioConfig", minioConfig);
+        ReflectionTestUtils.setField(uploadService, "documentStorageService", storageService);
+
+        when(minioConfig.getBucketName()).thenReturn("uploads");
+        when(minioConfig.getPrivateBucketName()).thenReturn("private-uploads");
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
     }
 

@@ -119,7 +119,7 @@ public class DocumentController {
         try {
             LogUtils.logBusiness("REINDEX_DOCUMENT", userId, "接收到重建文档索引请求: fileMd5=%s, role=%s", fileMd5, role);
 
-            Optional<FileUpload> fileOpt = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5);
+            Optional<FileUpload> fileOpt = resolveOwnedFile(fileMd5, userId, role);
             if (fileOpt.isEmpty()) {
                 monitor.end("重建失败：文档不存在");
                 Map<String, Object> response = new HashMap<>();
@@ -137,7 +137,7 @@ public class DocumentController {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
             }
 
-            var result = documentService.reindexDocument(fileMd5, userId);
+            var result = documentService.reindexDocument(file, userId);
             monitor.end("文档索引重建成功");
 
             Map<String, Object> data = new HashMap<>();
@@ -172,7 +172,7 @@ public class DocumentController {
         try {
             LogUtils.logBusiness("RETRY_VECTORIZATION_ASYNC", userId, "接收到异步向量化重试请求: fileMd5=%s, role=%s", fileMd5, role);
 
-            Optional<FileUpload> fileOpt = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5);
+            Optional<FileUpload> fileOpt = resolveOwnedFile(fileMd5, userId, role);
             if (fileOpt.isEmpty()) {
                 monitor.end("重试失败：文档不存在");
                 return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
@@ -190,7 +190,7 @@ public class DocumentController {
                 ));
             }
 
-            FileUpload queuedFile = documentService.enqueueAsyncVectorizationRetry(fileMd5, userId);
+            FileUpload queuedFile = documentService.enqueueAsyncVectorizationRetry(file, userId);
             monitor.end("异步向量化重试任务已提交");
 
             Map<String, Object> data = new HashMap<>();
@@ -297,6 +297,21 @@ public class DocumentController {
         }
     }
 
+    /**
+     * 优先按所有者定位文书记录，避免多个用户上传相同 MD5 时串记录；管理员可回退到最新记录。
+     */
+    private Optional<FileUpload> resolveOwnedFile(String fileMd5, String userId, String role) {
+        Optional<FileUpload> owned = fileUploadRepository
+                .findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId);
+        if (owned.isPresent()) {
+            return owned;
+        }
+        if ("ADMIN".equals(role)) {
+            return fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5);
+        }
+        return Optional.empty();
+    }
+
     private List<Map<String, Object>> convertFilesToResponse(List<FileUpload> files) {
         return files.stream().map(file -> {
             Map<String, Object> dto = new HashMap<>();
@@ -308,6 +323,9 @@ public class DocumentController {
             dto.put("orgTag", file.getOrgTag());
             dto.put("public", file.isPublic());
             dto.put("isPublic", file.isPublic());
+            dto.put("documentType", file.getDocumentTypeEnum().name());
+            dto.put("documentTypeLabel", file.getDocumentTypeEnum().getLabel());
+            dto.put("privateDocument", file.isPrivateDocument());
             dto.put("createdAt", file.getCreatedAt());
             dto.put("mergedAt", file.getMergedAt());
             dto.put("estimatedEmbeddingTokens", file.getEstimatedEmbeddingTokens());
@@ -355,7 +373,7 @@ public class DocumentController {
                 }
                 
                 FileUpload file = publicFile.get();
-                String downloadUrl = documentService.generateDownloadUrl(file.getFileMd5());
+                String downloadUrl = documentService.generateDownloadUrl(file);
                 
                 if (downloadUrl == null) {
                     Map<String, Object> response = new HashMap<>();
@@ -395,7 +413,7 @@ public class DocumentController {
             FileUpload file = targetFile.get();
             
             // 生成下载链接或返回预签名URL
-            String downloadUrl = documentService.generateDownloadUrl(file.getFileMd5());
+            String downloadUrl = documentService.generateDownloadUrl(file);
             
             if (downloadUrl == null) {
                 LogUtils.logUserOperation(userId, "DOWNLOAD_FILE_BY_NAME", fileName, "FAILED_GENERATE_URL");
@@ -624,7 +642,7 @@ public class DocumentController {
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
             }
 
-            DocumentService.PdfSinglePagePreview preview = documentService.getPdfSinglePagePreview(fileMd5, pageNumber);
+            DocumentService.PdfSinglePagePreview preview = documentService.getPdfSinglePagePreview(file, pageNumber);
             byte[] pdfBytes = preview.content();
             String encodedFileName = URLEncoder.encode(file.getFileName().replace(".pdf", "") + "-page-" + pageNumber + ".pdf",
                     StandardCharsets.UTF_8);
@@ -694,7 +712,7 @@ public class DocumentController {
                 return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
             }
 
-            String downloadUrl = documentService.generateDownloadUrl(file.getFileMd5());
+            String downloadUrl = documentService.generateDownloadUrl(file);
             if (downloadUrl == null) {
                 Map<String, Object> response = new HashMap<>();
                 response.put("code", HttpStatus.INTERNAL_SERVER_ERROR.value());
@@ -775,6 +793,13 @@ public class DocumentController {
             data.put("evidenceSnippet", detail.evidenceSnippet());
             data.put("score", detail.score());
             data.put("chunkId", detail.chunkId());
+            data.put("documentType", detail.documentType());
+            data.put("chunkStrategy", detail.chunkStrategy());
+            data.put("caseSection", detail.caseSection());
+            data.put("searchScope", detail.searchScope());
+            data.put("intentCategory", detail.intentCategory());
+            data.put("intentConfidence", detail.intentConfidence());
+            data.put("intentReason", detail.intentReason());
 
             Map<String, Object> response = new HashMap<>();
             response.put("code", 200);
@@ -805,7 +830,7 @@ public class DocumentController {
         payload.put("previewType", previewType);
 
         if ("text".equals(previewType)) {
-            String previewContent = documentService.getFilePreviewContent(file.getFileMd5(), fileName);
+            String previewContent = documentService.getFilePreviewContent(file, fileName);
             if (previewContent == null) {
                 return null;
             }
@@ -813,7 +838,7 @@ public class DocumentController {
             return payload;
         }
 
-        String previewUrl = documentService.generateDownloadUrl(file.getFileMd5());
+        String previewUrl = documentService.generateDownloadUrl(file);
         if (previewUrl == null) {
             return null;
         }

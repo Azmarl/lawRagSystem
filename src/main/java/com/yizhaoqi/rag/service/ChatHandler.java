@@ -40,6 +40,7 @@ public class ChatHandler {
     
     private static final Logger logger = LoggerFactory.getLogger(ChatHandler.class);
     private static final int MAX_CONTEXT_SNIPPET_LEN = 300;
+    private static final int MAX_PARENT_CONTEXT_SNIPPET_LEN = 1200;
     private static final int MAX_MATCHED_CHUNK_LEN = 800;
     private static final int MAX_EVIDENCE_SNIPPET_LEN = 160;
     private static final int GENERATION_COMPLETION_TIMEOUT_SECONDS = 120;
@@ -116,9 +117,12 @@ public class ChatHandler {
             List<Map<String, String>> history = getConversationHistory(conversationId);
             logger.debug("获取到 {} 条历史对话", history.size());
             
-            // 3. 执行带权限过滤的混合搜索
-            List<SearchResult> searchResults = searchService.searchWithPermission(userMessage, userId, 5);
-            logger.debug("搜索结果数量: {}", searchResults.size());
+            // 3. 意图识别 + 带权限过滤的混合搜索（法典 / 私人案件 / 混合）
+            String intentContext = buildIntentConversationContext(history);
+            List<SearchResult> searchResults = searchService.searchWithPermission(
+                    userMessage, userId, 5, intentContext);
+            logger.debug("搜索结果数量: {}, 私人案件结果数: {}", searchResults.size(),
+                    searchResults.stream().filter(SearchResult::isPrivateDocument).count());
             
             // 4. 构建上下文
             String context = buildContext(searchResults, finalGenerationId, userMessage);
@@ -425,9 +429,44 @@ public class ChatHandler {
             item.put("chapterName", detail.chapterName());
             item.put("sectionName", detail.sectionName());
             item.put("articleId", detail.articleId());
+            item.put("documentType", detail.documentType());
+            item.put("chunkStrategy", detail.chunkStrategy());
+            item.put("caseSection", detail.caseSection());
+            item.put("searchScope", detail.searchScope());
+            item.put("intentCategory", detail.intentCategory());
+            item.put("intentConfidence", detail.intentConfidence());
+            item.put("intentReason", detail.intentReason());
             serialized.put(String.valueOf(entry.getKey()), item);
         }
         return serialized;
+    }
+
+    /**
+     * 构造最近几轮对话摘要，供意图识别做指代消解。
+     */
+    private String buildIntentConversationContext(List<Map<String, String>> history) {
+        if (history == null || history.isEmpty()) {
+            return "";
+        }
+        StringBuilder context = new StringBuilder();
+        int start = Math.max(0, history.size() - 6);
+        for (int i = start; i < history.size(); i++) {
+            Map<String, String> message = history.get(i);
+            if (message == null) {
+                continue;
+            }
+            String role = message.getOrDefault("role", "");
+            String content = message.getOrDefault("content", "");
+            if (content == null || content.isBlank()) {
+                continue;
+            }
+            String compact = content.replaceAll("\\s+", " ").trim();
+            if (compact.length() > 200) {
+                compact = compact.substring(0, 200) + "…";
+            }
+            context.append(role).append(": ").append(compact).append('\n');
+        }
+        return context.toString();
     }
 
     private String buildContext(List<SearchResult> searchResults, String generationId, String userMessage) {
@@ -442,20 +481,27 @@ public class ChatHandler {
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < searchResults.size(); i++) {
             SearchResult result = searchResults.get(i);
-            String snippet = result.getTextContent();
-            if (snippet.length() > MAX_CONTEXT_SNIPPET_LEN) {
-                snippet = snippet.substring(0, MAX_CONTEXT_SNIPPET_LEN) + "…";
+            // 父子分块命中子块后，优先用父段回补更完整的上下文
+            boolean hasParentContext = result.getContextText() != null && !result.getContextText().isBlank();
+            String snippet = hasParentContext ? result.getContextText() : result.getTextContent();
+            int maxSnippetLength = hasParentContext
+                    ? MAX_PARENT_CONTEXT_SNIPPET_LEN : MAX_CONTEXT_SNIPPET_LEN;
+            if (snippet.length() > maxSnippetLength) {
+                snippet = snippet.substring(0, maxSnippetLength) + "…";
             }
             String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
             String fileMd5 = result.getFileMd5();
 
-            // 格式：[1] (test1.txt | 第5页) 文件内容... 或 [1] (test1.txt) 文件内容...
-            // 有页码时显示页码，方便AI引用
+            // 格式：[1] 【法律法规】(test1.txt | 第5页) 文件内容...
+            // 明确区分公开法典与私人案件文档，避免模型混淆引用来源
+            String corpusLabel = result.isPrivateDocument() ? "私人案件文档" : "法律法规";
             Integer pageNum = result.getPageNumber();
             if (pageNum != null && pageNum > 0) {
-                context.append(String.format("[%d] (%s | 第%d页) %s\n", i + 1, fileLabel, pageNum, snippet));
+                context.append(String.format("[%d] 【%s】(%s | 第%d页) %s\n",
+                        i + 1, corpusLabel, fileLabel, pageNum, snippet));
             } else {
-                context.append(String.format("[%d] (%s) %s\n", i + 1, fileLabel, snippet));
+                context.append(String.format("[%d] 【%s】(%s) %s\n",
+                        i + 1, corpusLabel, fileLabel, snippet));
             }
 
             // 保存引用编号到MD5的映射
@@ -554,6 +600,18 @@ public class ChatHandler {
             item.put("chapterName", r.getChapterName());
             item.put("sectionName", r.getSectionName());
             item.put("articleId", r.getArticleId());
+            item.put("documentType", r.getDocumentType());
+            item.put("chunkStrategy", r.getChunkStrategy());
+            item.put("caseSection", r.getCaseSection());
+            item.put("blockId", r.getBlockId());
+            item.put("parentBlockId", r.getParentBlockId());
+            item.put("contentType", r.getContentType());
+            item.put("contextText", r.getContextText());
+            item.put("searchScope", r.getSearchScope());
+            item.put("intentCategory", r.getIntentCategory());
+            item.put("intentConfidence", r.getIntentConfidence());
+            item.put("intentReason", r.getIntentReason());
+            item.put("sourceCorpus", r.getSourceCorpus());
             list.add(item);
         }
         return list;
@@ -686,7 +744,14 @@ public class ChatHandler {
                     (String) item.get("partName"),
                     (String) item.get("chapterName"),
                     (String) item.get("sectionName"),
-                    (String) item.get("articleId")
+                    (String) item.get("articleId"),
+                    (String) item.get("documentType"),
+                    (String) item.get("chunkStrategy"),
+                    (String) item.get("caseSection"),
+                    (String) item.get("searchScope"),
+                    (String) item.get("intentCategory"),
+                    item.get("intentConfidence") instanceof Number number ? number.doubleValue() : null,
+                    (String) item.get("intentReason")
             ));
         }
         return referenceMap;
@@ -719,7 +784,14 @@ public class ChatHandler {
                 result.getPartName(),
                 result.getChapterName(),
                 result.getSectionName(),
-                result.getArticleId()
+                result.getArticleId(),
+                result.getDocumentType(),
+                result.getChunkStrategy(),
+                result.getCaseSection(),
+                result.getSearchScope(),
+                result.getIntentCategory(),
+                result.getIntentConfidence(),
+                result.getIntentReason()
         );
     }
 
@@ -789,7 +861,14 @@ public class ChatHandler {
             String partName,
             String chapterName,
             String sectionName,
-            String articleId
+            String articleId,
+            String documentType,
+            String chunkStrategy,
+            String caseSection,
+            String searchScope,
+            String intentCategory,
+            Double intentConfidence,
+            String intentReason
     ) {
     }
 }

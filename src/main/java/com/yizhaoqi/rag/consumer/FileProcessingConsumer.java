@@ -44,10 +44,12 @@ public class FileProcessingConsumer {
         log.info("文件权限信息: userId={}, orgTag={}, isPublic={}", 
                 task.getUserId(), task.getOrgTag(), task.isPublic());
 
-        documentService.markVectorizationProcessing(task.getFileMd5(), false);
+        var fileUpload = documentService.findDocument(
+                task.getFileMd5(), task.getUserId(), task.resolveDocumentType());
+        documentService.markVectorizationProcessing(fileUpload, false);
 
         if (FileProcessingTask.TASK_TYPE_REINDEX.equals(task.getTaskType())) {
-            processReindexTask(task);
+            processReindexTask(task, fileUpload);
             return;
         }
 
@@ -65,23 +67,24 @@ public class FileProcessingConsumer {
                 fileStream = new BufferedInputStream(fileStream);
             }
 
-            // 解析文件
-            parseService.parseAndSave(task.getFileMd5(), fileStream, 
-                    task.getUserId(), task.getOrgTag(), task.isPublic());
-            log.info("文件解析完成，fileMd5: {}", task.getFileMd5());
+            // 解析文件（按上传时选择的文档类型选择解析策略）
+            parseService.parseAndSave(task.getFileMd5(), fileStream,
+                    task.getUserId(), task.getOrgTag(), task.isPublic(), task.resolveDocumentType());
+            log.info("文件解析完成，fileMd5: {}, documentType: {}", task.getFileMd5(), task.resolveDocumentType());
 
-            // 向量化处理
+            // 向量化处理（写入对应的 ES 索引）
             VectorizationService.VectorizationUsageResult vectorizationResult = vectorizationService.vectorizeWithUsage(
                     task.getFileMd5(),
                     task.getUserId(),
                     task.getOrgTag(),
                     task.isPublic(),
-                    task.getUserId()
+                    task.getUserId(),
+                    task.resolveDocumentType()
             );
-            documentService.markVectorizationCompleted(task.getFileMd5(), vectorizationResult);
+            documentService.markVectorizationCompleted(fileUpload, vectorizationResult);
             log.info("向量化完成，fileMd5: {}", task.getFileMd5());
         } catch (Exception e) {
-            documentService.markVectorizationFailed(task.getFileMd5(), e);
+            documentService.markVectorizationFailed(fileUpload, e);
             log.error("Error processing task: {}", task, e);
             // 抛出异常让 Kafka 的 DefaultErrorHandler 捕获并触发重试 / 死信
             throw new RuntimeException("Error processing task", e);
@@ -97,14 +100,14 @@ public class FileProcessingConsumer {
         }
     }
 
-    private void processReindexTask(FileProcessingTask task) {
+    private void processReindexTask(FileProcessingTask task, com.yizhaoqi.rag.model.FileUpload fileUpload) {
         try {
             String requesterId = task.getRequesterId() == null || task.getRequesterId().isBlank()
                     ? task.getUserId()
                     : task.getRequesterId();
-            documentService.reindexDocument(task.getFileMd5(), requesterId);
+            documentService.reindexDocument(fileUpload, requesterId);
         } catch (Exception e) {
-            documentService.markVectorizationFailed(task.getFileMd5(), e);
+            documentService.markVectorizationFailed(fileUpload, e);
             log.error("Error reindexing task: {}", task, e);
             throw new RuntimeException("Error reindexing task", e);
         }

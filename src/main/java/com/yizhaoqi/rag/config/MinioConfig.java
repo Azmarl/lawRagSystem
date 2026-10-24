@@ -29,6 +29,13 @@ public class MinioConfig {
     @Value("${minio.bucketName}")
     private String bucketName;
 
+    /**
+     * 私人案件文档独立 bucket。即使配置成与公开 bucket 相同，
+     * {@link com.yizhaoqi.rag.service.DocumentStorageService} 仍会使用 private/ 前缀做二次隔离。
+     */
+    @Value("${minio.privateBucketName:private-uploads}")
+    private String privateBucketName;
+
     @Value("${minio.publicUrl}")
     private String publicUrl;
 
@@ -50,19 +57,24 @@ public class MinioConfig {
                     .endpoint(endpoint)
                     .credentials(accessKey, secretKey)
                     .build();
-            boolean exists = bucketCheckClient.bucketExists(
-                    BucketExistsArgs.builder().bucket(bucketName).build()
-            );
-            if (!exists) {
-                logger.info("MinIO bucket '{}' 不存在，正在创建", bucketName);
-                bucketCheckClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
-                logger.info("MinIO bucket '{}' 已创建", bucketName);
-            } else {
-                logger.info("MinIO bucket '{}' 已存在", bucketName);
+            ensureBucket(bucketCheckClient, bucketName);
+            if (privateBucketName != null && !privateBucketName.isBlank()) {
+                ensureBucket(bucketCheckClient, privateBucketName);
             }
         } catch (Exception e) {
             logger.error("MinIO 桶检查/创建失败: {}", e.getMessage(), e);
             throw new RuntimeException("MinIO bucket initialization failed", e);
+        }
+    }
+
+    private void ensureBucket(MinioClient client, String bucket) throws Exception {
+        boolean exists = client.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());
+        if (!exists) {
+            logger.info("MinIO bucket '{}' 不存在，正在创建", bucket);
+            client.makeBucket(MakeBucketArgs.builder().bucket(bucket).build());
+            logger.info("MinIO bucket '{}' 已创建", bucket);
+        } else {
+            logger.info("MinIO bucket '{}' 已存在", bucket);
         }
     }
 

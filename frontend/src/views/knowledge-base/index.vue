@@ -71,6 +71,17 @@ const { columns, columnChecks, data, getData, loading } = useTable({
       )
     },
     {
+      key: 'documentType',
+      title: '文档类型',
+      width: 120,
+      render: row =>
+        row.documentType === 'PRIVATE_LEGAL' ? (
+          <NTag type="warning">私人案件</NTag>
+        ) : (
+          <NTag type="info">法律文档</NTag>
+        )
+    },
+    {
       key: 'fileMd5',
       title: 'MD5',
       width: 120,
@@ -173,6 +184,9 @@ function syncTaskFromServer(target: Api.KnowledgeBase.UploadTask, source: Api.Kn
     userId: source.userId,
     orgTag: source.orgTag,
     orgTagName: source.orgTagName,
+    documentType: source.documentType,
+    documentTypeLabel: source.documentTypeLabel,
+    privateDocument: source.privateDocument,
     public: source.public,
     isPublic: source.isPublic,
     createdAt: source.createdAt,
@@ -380,7 +394,7 @@ function renderActualEmbeddingUsage(row: Api.KnowledgeBase.UploadTask) {
 }
 
 const VECTORIZE_POLLING_INTERVAL = 10000;
-let vectorizationPollingTimer: ReturnType<typeof window.setTimeout> | null = null;
+let vectorizationPollingTimer: number | null = null;
 
 function clearVectorizationPolling() {
   if (vectorizationPollingTimer) {
@@ -517,7 +531,7 @@ async function onBeforeUpload(
         :data="data"
         size="small"
         :flex-height="!appStore.isMobile"
-        :scroll-x="true"
+        :scroll-x="1200"
         :loading="loading"
         remote
         :row-key="row => row.id"
@@ -525,7 +539,7 @@ async function onBeforeUpload(
         class="sm:h-full"
       />
     </NCard>
-    <UploadDialog v-model:visible="uploadVisible" />
+    <UploadDialog v-model:visible="uploadVisible" @success="getList" />
     <SearchDialog v-model:visible="searchVisible" />
 
     <!-- 文件预览弹窗 -->

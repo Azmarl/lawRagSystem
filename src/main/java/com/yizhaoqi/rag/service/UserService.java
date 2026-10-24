@@ -474,6 +474,42 @@ public class UserService {
     }
 
     /**
+     * 获取（必要时创建）用户的私人组织标签。
+     *
+     * <p>私人案件文档必须归属该标签，且永远不公开。历史管理员账号可能只配置了
+     * default/admin 标签，这里会补建 {@code PRIVATE_<username>} 并写回用户标签列表。</p>
+     */
+    @Transactional
+    public String getUserPrivateOrg(String userId) {
+        User user = resolveUser(userId);
+        String privateTagId = PRIVATE_TAG_PREFIX + user.getUsername();
+        if (!organizationTagRepository.existsByTagId(privateTagId)) {
+            createPrivateOrgTag(privateTagId, user.getUsername(), user);
+        }
+
+        List<String> tags = new ArrayList<>();
+        if (user.getOrgTags() != null && !user.getOrgTags().isBlank()) {
+            tags.addAll(Arrays.stream(user.getOrgTags().split(","))
+                    .map(String::trim)
+                    .filter(tag -> !tag.isEmpty())
+                    .toList());
+        }
+        if (!tags.contains(privateTagId)) {
+            tags.add(privateTagId);
+            user.setOrgTags(String.join(",", tags));
+            if (user.getPrimaryOrg() == null || user.getPrimaryOrg().isBlank()) {
+                user.setPrimaryOrg(privateTagId);
+            }
+            userRepository.save(user);
+            orgTagCacheService.deleteUserOrgTagsCache(user.getUsername());
+            orgTagCacheService.cacheUserOrgTags(user.getUsername(), tags);
+            orgTagCacheService.cacheUserPrimaryOrg(user.getUsername(), user.getPrimaryOrg());
+            orgTagCacheService.deleteUserEffectiveTagsCache(user.getUsername());
+        }
+        return privateTagId;
+    }
+
+    /**
      * 获取组织标签树结构
      * 
      * @return 组织标签树结构

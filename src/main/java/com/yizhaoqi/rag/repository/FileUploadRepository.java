@@ -24,6 +24,9 @@ public interface FileUploadRepository extends JpaRepository<FileUpload, Long> {
 
     Optional<FileUpload> findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(String fileMd5, String userId);
 
+    Optional<FileUpload> findFirstByFileMd5AndUserIdAndDocumentTypeOrderByCreatedAtDesc(
+            String fileMd5, String userId, String documentType);
+
     Optional<FileUpload> findFirstByFileMd5AndIsPublicTrueOrderByCreatedAtDesc(String fileMd5);
 
     Optional<FileUpload> findFirstByFileNameAndIsPublicTrueOrderByCreatedAtDesc(String fileName);
@@ -37,21 +40,25 @@ public interface FileUploadRepository extends JpaRepository<FileUpload, Long> {
     void deleteByFileMd5AndUserId(String fileMd5, String userId);
     
     /**
-     * 查询用户自己的文件和公开文件
+     * 查询用户自己的文件和公开文件。
+     * 私人案件文档只允许所有者本人访问，即使其组织标签意外与其他组织重合也不会通过公开/组织分支泄漏。
      */
-    List<FileUpload> findByUserIdOrIsPublicTrue(String userId);
-    
+    @Query("SELECT f FROM FileUpload f WHERE f.userId = :userId "
+            + "OR (f.isPublic = true AND (f.documentType IS NULL OR f.documentType <> 'PRIVATE_LEGAL'))")
+    List<FileUpload> findOwnedOrPublicFiles(@Param("userId") String userId);
+
     /**
-     * 查询用户可访问的所有文件（考虑层级标签权限）
-     * 包括：1. 用户自己上传的文件
-     *      2. 公开的文件
-     *      3. 用户所属组织的文件（包含层级关系）
+     * 查询用户可访问的所有文件（考虑层级标签权限）。
+     *
+     * <p>私人案件文档（documentType=PRIVATE_LEGAL）只通过 userId 分支返回，永远不会走公开或组织分支。</p>
      *
      * @param userId 用户ID
      * @param orgTagList 用户有效的组织标签列表（包含层级结构）
      * @return 用户可访问的文件列表
      */
-    @Query("SELECT f FROM FileUpload f WHERE f.userId = :userId OR f.isPublic = true OR (f.orgTag IN :orgTagList AND f.isPublic = false)")
+    @Query("SELECT f FROM FileUpload f WHERE f.userId = :userId "
+            + "OR (f.isPublic = true AND (f.documentType IS NULL OR f.documentType <> 'PRIVATE_LEGAL')) "
+            + "OR (f.orgTag IN :orgTagList AND (f.documentType IS NULL OR f.documentType <> 'PRIVATE_LEGAL'))")
     List<FileUpload> findAccessibleFilesWithTags(@Param("userId") String userId, @Param("orgTagList") List<String> orgTagList);
     
     /**
@@ -61,7 +68,9 @@ public interface FileUploadRepository extends JpaRepository<FileUpload, Long> {
      * @param orgTagList 用户所属的组织标签列表（逗号分隔）
      * @return 用户可访问的文件列表
      */
-    @Query("SELECT f FROM FileUpload f WHERE f.userId = :userId OR f.isPublic = true OR (f.orgTag IN :orgTagList AND f.isPublic = false)")
+    @Query("SELECT f FROM FileUpload f WHERE f.userId = :userId "
+            + "OR (f.isPublic = true AND (f.documentType IS NULL OR f.documentType <> 'PRIVATE_LEGAL')) "
+            + "OR (f.orgTag IN :orgTagList AND (f.documentType IS NULL OR f.documentType <> 'PRIVATE_LEGAL'))")
     List<FileUpload> findAccessibleFiles(@Param("userId") String userId, @Param("orgTagList") List<String> orgTagList);
     
     /**

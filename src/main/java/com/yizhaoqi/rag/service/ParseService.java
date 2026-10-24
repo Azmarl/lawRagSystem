@@ -1,18 +1,23 @@
 package com.yizhaoqi.rag.service;
 
 import com.yizhaoqi.rag.chunker.ChunkDTO;
-import com.yizhaoqi.rag.chunker.PrivateDocumentChunker;
-import com.yizhaoqi.rag.chunker.TreeAwareChunker;
+import com.yizhaoqi.rag.chunker.ChunkRole;
+import com.yizhaoqi.rag.chunker.ChunkStrategy;
+import com.yizhaoqi.rag.chunker.ContentType;
+import com.yizhaoqi.rag.chunker.DocumentType;
+import com.yizhaoqi.rag.chunker.OverlapTextChunker;
 import com.yizhaoqi.rag.model.DocumentVector;
-import com.yizhaoqi.rag.parser.LegalStructureParser;
-import com.yizhaoqi.rag.parser.LegalNode;
+import com.yizhaoqi.rag.model.PrivateDocumentVector;
+import com.yizhaoqi.rag.model.PublicDocumentVector;
+import com.yizhaoqi.rag.parser.strategy.DocumentParsingStrategyFactory;
 import com.yizhaoqi.rag.repository.DocumentVectorRepository;
+import com.yizhaoqi.rag.repository.PrivateDocumentVectorRepository;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
-import org.apache.tika.parser.ParseContext;
 import org.apache.tika.parser.AutoDetectParser;
+import org.apache.tika.parser.ParseContext;
 import org.apache.tika.sax.BodyContentHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,7 +26,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.xml.sax.SAXException;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
@@ -42,9 +49,18 @@ public class ParseService {
     private DocumentVectorRepository documentVectorRepository;
 
     @Autowired
+    private PrivateDocumentVectorRepository privateDocumentVectorRepository;
+
+    @Autowired
     private UsageQuotaService usageQuotaService;
 
-    @Value("${file.parsing.chunk-size}")
+    @Autowired
+    private DocumentParsingStrategyFactory parsingStrategyFactory;
+
+    @Autowired
+    private OverlapTextChunker overlapTextChunker;
+
+    @Value("${file.parsing.chunk-size:512}")
     private int chunkSize;
 
     @Value("${file.parsing.overlap-size:100}")
@@ -62,76 +78,45 @@ public class ParseService {
     @Value("${file.parsing.max-memory-threshold:0.8}")
     private double maxMemoryThreshold;
 
-    // ===== 新流水线组件 =====
-    private final LegalStructureParser legalStructureParser = new LegalStructureParser();
-        private final PrivateDocumentChunker privateDocumentChunker =
-            new PrivateDocumentChunker(new com.yizhaoqi.rag.chunker.LegalTermScorer(), 512, 0.12);
-
     public ParseService() {
     }
 
     /**
-     * 以流式方式解析文件并保存到数据库。
-     * 新流水线：Tika/PDFBox 提取纯文本 → LegalStructureParser 建树 → TreeAwareChunker 分块 → 入库。
-     *
-     * @param fileMd5    文件的MD5哈希值
-     * @param fileStream 文件输入流
-     * @param userId     上传用户ID
-     * @param orgTag     组织标签
-     * @param isPublic   是否公开
-     * @throws IOException   如果文件读取过程中发生错误
-     * @throws TikaException 如果文件解析过程中发生错误
+     * 兼容旧调用：未指定文档类型时按“法律文档”处理。
      */
     public void parseAndSave(String fileMd5, InputStream fileStream,
             String userId, String orgTag, boolean isPublic) throws IOException, TikaException {
-        logger.info("开始流式解析文件，fileMd5: {}, userId: {}, orgTag: {}, isPublic: {}",
-                fileMd5, userId, orgTag, isPublic);
+        parseAndSave(fileMd5, fileStream, userId, orgTag, isPublic, null);
+    }
+
+    /**
+     * 解析并保存文件。
+     *
+     * @param documentType 用户上传时选择的文档类型；为 null 时兼容旧数据，自动识别法典结构
+     */
+    public void parseAndSave(String fileMd5, InputStream fileStream, String userId,
+            String orgTag, boolean isPublic, DocumentType documentType) throws IOException, TikaException {
+        logger.info("开始流式解析文件，fileMd5: {}, userId: {}, orgTag: {}, isPublic: {}, requestedType: {}",
+                fileMd5, userId, orgTag, isPublic, documentType);
 
         checkMemoryThreshold();
 
         try (BufferedInputStream bufferedStream = new BufferedInputStream(fileStream, bufferSize)) {
-            if (isPdfDocument(bufferedStream)) {
-                parsePdfAndSave(fileMd5, bufferedStream, userId, orgTag, isPublic);
-                logger.info("PDF 文件树状分块解析和入库完成，fileMd5: {}", fileMd5);
-                return;
-            }
-
-            // Tika 提取纯文本 → 新分块流水线
-            FullTextExtractionHandler handler = new FullTextExtractionHandler();
-            Metadata metadata = new Metadata();
-            ParseContext context = new ParseContext();
-            AutoDetectParser parser = new AutoDetectParser();
-
-            parser.parse(bufferedStream, handler, metadata, context);
-            String fullText = handler.getFullText();
-
+            String fullText = extractFullText(bufferedStream);
             if (fullText.isBlank()) {
-                logger.warn("Tika 提取到空文本，fileMd5: {}", fileMd5);
+                logger.warn("提取到空文本，跳过解析，fileMd5: {}", fileMd5);
                 return;
             }
 
-            if (!isStructuredLegalText(fullText)) {
-                saveChildChunks(fileMd5, privateDocumentChunker.chunk(fullText), userId, orgTag, isPublic);
-                logger.info("通用私有文档语义分块解析和入库完成，fileMd5: {}", fileMd5);
+            DocumentType effectiveType = documentType == null ? detectDocumentType(fullText) : documentType;
+            List<ChunkDTO> chunks = buildChunks(fullText, effectiveType);
+            if (chunks.isEmpty()) {
+                logger.warn("未生成任何分块，fileMd5: {}, documentType: {}", fileMd5, effectiveType);
                 return;
             }
-
-            // 新流水线：结构解析 → 树状分块
-            LegalNode root = legalStructureParser.parse(fullText);
-            List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
-
-            if (chunkDTOs.isEmpty()) {
-                // 降级：非法律文本回退到简单段落分块
-                logger.info("未检测到法律层级结构，使用简单分块作为降级方案，fileMd5: {}", fileMd5);
-                List<String> fallbackChunks = splitTextIntoChunksFallback(fullText, chunkSize);
-                saveChildChunksFallback(fileMd5, fallbackChunks, userId, orgTag, isPublic);
-                return;
-            }
-
-            // 保存分块结果
-            saveChildChunks(fileMd5, chunkDTOs, userId, orgTag, isPublic);
-            logger.info("文件流式解析和树状分块入库完成，fileMd5: {}", fileMd5);
-
+            saveChunks(fileMd5, chunks, effectiveType, userId, orgTag, isPublic);
+            logger.info("文件解析和入库完成，fileMd5: {}, documentType: {}, chunkCount: {}",
+                    fileMd5, effectiveType, chunks.size());
         } catch (SAXException e) {
             logger.error("文档解析失败，fileMd5: {}", fileMd5, e);
             throw new RuntimeException("文档解析失败", e);
@@ -139,46 +124,31 @@ public class ParseService {
     }
 
     /**
-     * 兼容旧版本的解析方法
+     * 兼容旧版本的解析方法。
      */
     public void parseAndSave(String fileMd5, InputStream fileStream) throws IOException, TikaException {
-        parseAndSave(fileMd5, fileStream, "unknown", "DEFAULT", false);
+        parseAndSave(fileMd5, fileStream, "unknown", "DEFAULT", false, null);
     }
 
     public EmbeddingEstimate estimateEmbeddingUsage(InputStream fileStream) throws IOException, TikaException {
-        logger.info("开始估算文档 Embedding Token");
+        return estimateEmbeddingUsage(fileStream, null);
+    }
+
+    public EmbeddingEstimate estimateEmbeddingUsage(InputStream fileStream, DocumentType documentType)
+            throws IOException, TikaException {
+        logger.info("开始估算文档 Embedding Token，requestedType: {}", documentType);
         checkMemoryThreshold();
 
         try (BufferedInputStream bufferedStream = new BufferedInputStream(fileStream, bufferSize)) {
-            if (isPdfDocument(bufferedStream)) {
-                return estimatePdfEmbeddingUsage(bufferedStream);
+            String fullText = extractFullText(bufferedStream);
+            if (fullText.isBlank()) {
+                return new EmbeddingEstimate(0, 0);
             }
-
-            FullTextExtractionHandler handler = new FullTextExtractionHandler();
-            Metadata metadata = new Metadata();
-            ParseContext context = new ParseContext();
-            AutoDetectParser parser = new AutoDetectParser();
-            parser.parse(bufferedStream, handler, metadata, context);
-
-            String fullText = handler.getFullText();
-            if (!isStructuredLegalText(fullText)) {
-                List<ChunkDTO> privateChunks = privateDocumentChunker.chunk(fullText);
-                long tokens = usageQuotaService.estimateEmbeddingTokens(
-                        privateChunks.stream().map(ChunkDTO::getTextContent).toList());
-                return new EmbeddingEstimate(tokens, privateChunks.size());
-            }
-            LegalNode root = legalStructureParser.parse(fullText);
-            List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
-
-            if (chunkDTOs.isEmpty()) {
-                List<String> fallbackChunks = splitTextIntoChunksFallback(fullText, chunkSize);
-                long tokens = usageQuotaService.estimateEmbeddingTokens(fallbackChunks);
-                return new EmbeddingEstimate(tokens, fallbackChunks.size());
-            }
-
-            List<String> texts = chunkDTOs.stream().map(ChunkDTO::getTextContent).toList();
-            long tokens = usageQuotaService.estimateEmbeddingTokens(texts);
-            return new EmbeddingEstimate(tokens, chunkDTOs.size());
+            DocumentType effectiveType = documentType == null ? detectDocumentType(fullText) : documentType;
+            List<ChunkDTO> chunks = buildChunks(fullText, effectiveType);
+            long tokens = usageQuotaService.estimateEmbeddingTokens(
+                    chunks.stream().map(ChunkDTO::getTextContent).toList());
+            return new EmbeddingEstimate(tokens, chunks.size());
         } catch (SAXException e) {
             logger.error("文档 Embedding Token 估算失败", e);
             throw new RuntimeException("文档 Embedding Token 估算失败", e);
@@ -186,72 +156,64 @@ public class ParseService {
     }
 
     // ========================
-    // 内存检查（保留）
+    // 文本提取
     // ========================
 
-    private void checkMemoryThreshold() {
-        Runtime runtime = Runtime.getRuntime();
-        long maxMemory = runtime.maxMemory();
-        long totalMemory = runtime.totalMemory();
-        long freeMemory = runtime.freeMemory();
-        long usedMemory = totalMemory - freeMemory;
+    private String extractFullText(BufferedInputStream stream) throws IOException, TikaException, SAXException {
+        if (isPdfDocument(stream)) {
+            return extractPdfText(stream);
+        }
+        StructuredTextExtractionHandler handler = new StructuredTextExtractionHandler();
+        Metadata metadata = new Metadata();
+        ParseContext context = new ParseContext();
+        AutoDetectParser parser = new AutoDetectParser();
+        parser.parse(stream, handler, metadata, context);
+        return handler.getFullText();
+    }
 
-        double memoryUsage = (double) usedMemory / maxMemory;
-
-        if (memoryUsage > maxMemoryThreshold) {
-            logger.warn("内存使用率过高: {:.2f}%, 触发垃圾回收", memoryUsage * 100);
-            System.gc();
-
-            usedMemory = runtime.totalMemory() - runtime.freeMemory();
-            memoryUsage = (double) usedMemory / maxMemory;
-
-            if (memoryUsage > maxMemoryThreshold) {
-                throw new RuntimeException("内存不足，无法处理大文件。当前使用率: " +
-                    String.format("%.2f%%", memoryUsage * 100));
-            }
+    private String extractPdfText(BufferedInputStream stream) throws IOException {
+        try (PDDocument document = PDDocument.load(stream)) {
+            List<String> cleanedPageTexts = extractCleanPdfPageTexts(document);
+            return String.join("\n", cleanedPageTexts);
         }
     }
 
     // ========================
-    // 新流水线：Tika 全文本提取
+    // 策略分块
     // ========================
 
-    /**
-     * Tika 全文本提取处理器（不在此处做任何切分）。
-     */
-    private class FullTextExtractionHandler extends BodyContentHandler {
-        private final StringBuilder fullBuffer = new StringBuilder();
+    private DocumentType detectDocumentType(String text) {
+        return isStructuredLegalText(text) ? DocumentType.STRUCTURED_LAW : DocumentType.PRIVATE_LEGAL;
+    }
 
-        public FullTextExtractionHandler() {
-            super(-1);
+    private List<ChunkDTO> buildChunks(String fullText, DocumentType documentType) {
+        DocumentType resolved = documentType == null ? DocumentType.STRUCTURED_LAW : documentType;
+        List<ChunkDTO> chunks = new ArrayList<>(parsingStrategyFactory.get(resolved).parse(fullText));
+        if (!chunks.isEmpty()) {
+            return chunks;
         }
 
-        @Override
-        public void characters(char[] ch, int start, int length) {
-            fullBuffer.append(ch, start, length);
-        }
-
-        public String getFullText() {
-            return fullBuffer.toString();
-        }
+        // 结构化解析失败时的统一保底：按句子/字符重叠分块，保证文档仍可被检索
+        String reason = resolved.isPrivateDocument() ? "私人案件结构解析失败" : "法典结构解析失败";
+        logger.info("{}，使用字符重叠保底分块，documentType: {}", reason, resolved);
+        return overlapTextChunker.chunk(fullText, resolved);
     }
 
     // ========================
-    // 新流水线：保存 ChunkDTO 列表
+    // 分块持久化
     // ========================
 
-    /**
-     * 将 ChunkDTO 列表保存到数据库（新版本，携带法律层级元数据）。
-     */
-    private int saveChildChunks(String fileMd5, List<ChunkDTO> chunks,
+    private void saveChunks(String fileMd5, List<ChunkDTO> chunks, DocumentType documentType,
             String userId, String orgTag, boolean isPublic) {
         int currentChunkId = 0;
+        boolean privateDocument = documentType.isPrivateDocument();
         for (ChunkDTO chunk : chunks) {
             if (chunk.getTextContent() == null || chunk.getTextContent().isBlank()) {
                 continue;
             }
             currentChunkId++;
-            var vector = new DocumentVector();
+
+            DocumentVector vector = privateDocument ? new PrivateDocumentVector() : new PublicDocumentVector();
             vector.setFileMd5(fileMd5);
             vector.setChunkId(currentChunkId);
             vector.setTextContent(chunk.getTextContent());
@@ -259,9 +221,8 @@ public class ParseService {
             vector.setAnchorText(buildAnchorText(chunk.getTextContent()));
             vector.setUserId(userId);
             vector.setOrgTag(orgTag);
-            vector.setPublic(isPublic);
+            vector.setPublic(!privateDocument && isPublic);
 
-            // 法律层级元数据
             vector.setChunkLevel(chunk.getChunkLevel());
             vector.setPartName(chunk.getPartName());
             vector.setChapterName(chunk.getChapterName());
@@ -271,111 +232,45 @@ public class ParseService {
             vector.setLegalTermDensity(chunk.getLegalTermDensity());
             vector.setParentBlockId(chunk.getParentBlockId());
             vector.setChunkPosition(chunk.getChunkPosition());
+            vector.setDocumentType(documentType.name());
+            vector.setChunkStrategy(chunk.getChunkStrategy() == null
+                    ? defaultChunkStrategy(documentType).name()
+                    : chunk.getChunkStrategy());
+            vector.setCaseSection(chunk.getCaseSection());
+            vector.setBlockId(chunk.getBlockId());
+            vector.setChunkRole(chunk.getChunkRole() == null
+                    ? ChunkRole.CHILD.name() : chunk.getChunkRole());
+            vector.setContentType(chunk.getContentType() == null
+                    ? ContentType.TEXT.name() : chunk.getContentType());
 
-            documentVectorRepository.save(vector);
+            if (privateDocument) {
+                privateDocumentVectorRepository.save((PrivateDocumentVector) vector);
+            } else {
+                documentVectorRepository.save((PublicDocumentVector) vector);
+            }
         }
-        logger.info("成功保存 {} 个子切片到数据库（树状分块模式）", currentChunkId);
-        return currentChunkId;
+        logger.info("成功保存 {} 个分块到 {}，documentType: {}",
+                currentChunkId, privateDocument ? "private_document_vectors" : "document_vectors", documentType);
     }
 
-    /**
-     * 降级保存：使用旧格式 List<String>。
-     */
-    private int saveChildChunksFallback(String fileMd5, List<String> chunks,
-            String userId, String orgTag, boolean isPublic) {
-        int currentChunkId = 0;
-        for (String chunk : chunks) {
-            if (chunk == null || chunk.isBlank()) {
-                continue;
-            }
-            currentChunkId++;
-            var vector = new DocumentVector();
-            vector.setFileMd5(fileMd5);
-            vector.setChunkId(currentChunkId);
-            vector.setTextContent(chunk);
-            vector.setPageNumber(null);
-            vector.setAnchorText(buildAnchorText(chunk));
-            vector.setUserId(userId);
-            vector.setOrgTag(orgTag);
-            vector.setPublic(isPublic);
-            documentVectorRepository.save(vector);
-        }
-        logger.info("成功保存 {} 个子切片到数据库（降级模式）", currentChunkId);
-        return currentChunkId;
+    private ChunkStrategy defaultChunkStrategy(DocumentType documentType) {
+        return documentType.isPrivateDocument() ? ChunkStrategy.CASE_STRUCTURE : ChunkStrategy.TREE_AWARE;
     }
 
-    // ========================
-    // PDF 解析（保留核心逻辑 + 新分块流水线）
-    // ========================
-
-    private void parsePdfAndSave(String fileMd5, InputStream fileStream,
-            String userId, String orgTag, boolean isPublic) throws IOException {
-        try (PDDocument document = PDDocument.load(fileStream)) {
-
-            // 保留：提取并清理每页文本
-            List<String> cleanedPageTexts = extractCleanPdfPageTexts(document);
-
-            // 拼接所有页的文本
-            String fullText = String.join("\n", cleanedPageTexts);
-
-            if (!isStructuredLegalText(fullText)) {
-                saveChildChunks(fileMd5, privateDocumentChunker.chunk(fullText), userId, orgTag, isPublic);
-                return;
-            }
-
-            // 新流水线：结构解析 → 树状分块
-            LegalNode root = legalStructureParser.parse(fullText);
-            List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
-
-            if (chunkDTOs.isEmpty()) {
-                logger.info("PDF 未检测到法律层级结构，使用简单分块作为降级方案，fileMd5: {}",
-                        fileMd5);
-                int savedChunkCount = 0;
-                for (int pageNumber = 1; pageNumber <= cleanedPageTexts.size(); pageNumber++) {
-                    String pageText = cleanedPageTexts.get(pageNumber - 1);
-                    if (pageText == null || pageText.isBlank()) {
-                        continue;
-                    }
-                    List<String> childChunks = splitTextIntoChunksFallback(pageText, chunkSize);
-                    savedChunkCount = saveChildChunksFallback(fileMd5, childChunks,
-                            userId, orgTag, isPublic);
-                }
-                return;
-            }
-
-            saveChildChunks(fileMd5, chunkDTOs, userId, orgTag, isPublic);
+    private String buildAnchorText(String chunk) {
+        if (chunk == null || chunk.isBlank()) {
+            return null;
         }
-    }
-
-    private EmbeddingEstimate estimatePdfEmbeddingUsage(InputStream fileStream) throws IOException {
-        try (PDDocument document = PDDocument.load(fileStream)) {
-            List<String> cleanedPageTexts = extractCleanPdfPageTexts(document);
-            String fullText = String.join("\n", cleanedPageTexts);
-
-            if (!isStructuredLegalText(fullText)) {
-                List<ChunkDTO> privateChunks = privateDocumentChunker.chunk(fullText);
-                long tokens = usageQuotaService.estimateEmbeddingTokens(
-                        privateChunks.stream().map(ChunkDTO::getTextContent).toList());
-                return new EmbeddingEstimate(tokens, privateChunks.size());
-            }
-
-            LegalNode root = legalStructureParser.parse(fullText);
-            List<ChunkDTO> chunkDTOs = newChunker().chunk(root);
-
-            if (chunkDTOs.isEmpty()) {
-                List<String> fallbackChunks = splitTextIntoChunksFallback(fullText, chunkSize);
-                long tokens = usageQuotaService.estimateEmbeddingTokens(fallbackChunks);
-                return new EmbeddingEstimate(tokens, fallbackChunks.size());
-            }
-
-            List<String> texts = chunkDTOs.stream().map(ChunkDTO::getTextContent).toList();
-            long tokens = usageQuotaService.estimateEmbeddingTokens(texts);
-            return new EmbeddingEstimate(tokens, chunkDTOs.size());
+        String normalized = chunk.replaceAll("\\s+", " ").trim();
+        int maxLength = 120;
+        if (normalized.length() <= maxLength) {
+            return normalized;
         }
+        return normalized.substring(0, maxLength) + "…";
     }
 
     // ========================
-    // PDF 文本清理（护城河代码，完整保留）
+    // PDF 文本清理（保留原有护城河逻辑）
     // ========================
 
     private List<String> extractCleanPdfPageTexts(PDDocument document) throws IOException {
@@ -396,15 +291,9 @@ public class ParseService {
         List<String> cleanedPages = new ArrayList<>(rawPageLines.size());
         for (int pageIndex = 0; pageIndex < rawPageLines.size(); pageIndex++) {
             List<String> cleanedLines = removePdfBoilerplateLines(
-                    rawPageLines.get(pageIndex),
-                    topLineCounts,
-                    bottomLineCounts,
-                    repeatedThreshold
-            );
-            String cleanedText = String.join("\n", cleanedLines).trim();
-            cleanedPages.add(cleanedText);
+                    rawPageLines.get(pageIndex), topLineCounts, bottomLineCounts, repeatedThreshold);
+            cleanedPages.add(String.join("\n", cleanedLines).trim());
         }
-
         return cleanedPages;
     }
 
@@ -420,8 +309,7 @@ public class ParseService {
         return result;
     }
 
-    private Map<String, Integer> collectBoundaryLineCounts(List<List<String>> pageLines,
-            boolean topBoundary) {
+    private Map<String, Integer> collectBoundaryLineCounts(List<List<String>> pageLines, boolean topBoundary) {
         Map<String, Integer> counts = new HashMap<>();
         for (List<String> lines : pageLines) {
             List<String> boundaryLines = topBoundary
@@ -429,10 +317,9 @@ public class ParseService {
                     : lastMeaningfulLines(lines, PDF_BOUNDARY_SCAN_LINES);
             for (String line : boundaryLines) {
                 String key = normalizePdfBoundaryLine(line);
-                if (key == null) {
-                    continue;
+                if (key != null) {
+                    counts.merge(key, 1, Integer::sum);
                 }
-                counts.merge(key, 1, Integer::sum);
             }
         }
         return counts;
@@ -467,12 +354,10 @@ public class ParseService {
         return result;
     }
 
-    private List<String> removePdfBoilerplateLines(
-            List<String> lines,
+    private List<String> removePdfBoilerplateLines(List<String> lines,
             Map<String, Integer> topLineCounts,
             Map<String, Integer> bottomLineCounts,
             int repeatedThreshold) {
-
         int start = 0;
         int remainingTopChecks = PDF_BOUNDARY_SCAN_LINES;
         while (start < lines.size() && remainingTopChecks > 0) {
@@ -553,84 +438,225 @@ public class ParseService {
         return hasHierarchy || articleCount >= 3;
     }
 
-    private String buildAnchorText(String chunk) {
-        if (chunk == null || chunk.isBlank()) {
-            return null;
+    // ========================
+    // 旧版解析工具（保留供既有测试/调用方使用）
+    // ========================
+
+    private List<String> splitLongSentence(String sentence, int chunkSize) {
+        List<String> result = new ArrayList<>();
+        if (sentence == null || sentence.isEmpty() || chunkSize <= 0) {
+            return result;
         }
-        String normalized = chunk.replaceAll("\\s+", " ").trim();
-        int maxLength = 120;
-        if (normalized.length() <= maxLength) {
-            return normalized;
+        int start = 0;
+        while (start < sentence.length()) {
+            int end = Math.min(sentence.length(), start + chunkSize);
+            if (end < sentence.length() && Character.isHighSurrogate(sentence.charAt(end - 1))) {
+                end++;
+            }
+            result.add(sentence.substring(start, end));
+            start = end;
         }
-        return normalized.substring(0, maxLength) + "…";
+        return result;
     }
 
-    // ========================
-    // 降级分块（简单段落分块，非法律文本时使用）
-    // ========================
-
-    /**
-     * 简单段落分块：按 \\n\\n+ 切分段落，不依赖 HanLP。
-     */
-    private List<String> splitTextIntoChunksFallback(String text, int chunkSize) {
-        if (text == null || text.isBlank()) {
-            return new ArrayList<>();
+    private List<String> splitTextIntoChunksWithSemantics(String text, int chunkSize) {
+        List<String> result = new ArrayList<>();
+        if (text == null || text.isBlank() || chunkSize <= 0) {
+            return result;
         }
-        List<String> chunks = new ArrayList<>();
-        String[] paragraphs = text.split("\\n\\n+");
-        StringBuilder currentChunk = new StringBuilder();
 
-        for (String paragraph : paragraphs) {
-            String p = paragraph.trim();
-            if (p.isEmpty()) {
+        List<String> chunks = new ArrayList<>();
+        for (String rawParagraph : text.split("\\n\\n+")) {
+            String paragraph = rawParagraph.strip();
+            if (paragraph.isEmpty()) {
                 continue;
             }
-            if (currentChunk.length() > 0
-                    && currentChunk.length() + p.length() + 2 > chunkSize) {
-                chunks.add(currentChunk.toString().trim());
-                currentChunk = new StringBuilder();
+            if (paragraph.length() <= chunkSize) {
+                chunks.add(paragraph);
+                continue;
             }
-            if (currentChunk.length() > 0) {
-                currentChunk.append("\n\n");
+            List<String> sentences = new ArrayList<>();
+            for (String sentence : paragraph.split("(?<=[。！？!?；;])")) {
+                if (!sentence.isBlank()) {
+                    sentences.add(sentence.strip());
+                }
             }
-            currentChunk.append(p);
+            if (sentences.isEmpty()) {
+                chunks.addAll(splitLongSentence(paragraph, chunkSize));
+                continue;
+            }
 
-            // 如果单段太长，按句子切
-            if (p.length() > chunkSize) {
-                // 完成当前 chunk
-                if (!currentChunk.isEmpty() && !currentChunk.toString().equals(p)) {
-                    chunks.add(currentChunk.toString().trim());
+            StringBuilder current = new StringBuilder();
+            for (String sentence : sentences) {
+                if (current.length() > 0 && current.length() + sentence.length() > chunkSize) {
+                    chunks.add(current.toString());
+                    current.setLength(0);
                 }
-                // 按句子切长段落
-                int start = 0;
-                while (start < p.length()) {
-                    int end = Math.min(start + chunkSize, p.length());
-                    // 尝试在句末切分
-                    if (end < p.length()) {
-                        int lastPeriod = p.lastIndexOf('。', end);
-                        if (lastPeriod > start) {
-                            end = lastPeriod + 1;
-                        }
-                    }
-                    chunks.add(p.substring(start, end).trim());
-                    start = end;
+                if (sentence.length() > chunkSize) {
+                    chunks.addAll(splitLongSentence(sentence, chunkSize));
+                } else {
+                    current.append(sentence);
                 }
-                currentChunk = new StringBuilder();
+            }
+            if (current.length() > 0) {
+                chunks.add(current.toString());
             }
         }
 
-        if (!currentChunk.isEmpty()) {
-            chunks.add(currentChunk.toString().trim());
+        // 合并过短 chunk，避免出现只有标题的碎片
+        int minSize = Math.max(1, minChunkSize);
+        List<String> merged = new ArrayList<>();
+        for (int index = 0; index < chunks.size(); index++) {
+            String current = chunks.get(index);
+            if (current.length() < minSize && index + 1 < chunks.size()) {
+                merged.add(current + "\n\n" + chunks.get(++index));
+            } else {
+                merged.add(current);
+            }
         }
-        return chunks;
+
+        // 给后续 chunk 增加上一 chunk 的尾句重叠
+        for (int index = 1; index < merged.size(); index++) {
+            String previous = merged.get(index - 1);
+            String overlap = trailingOverlap(previous);
+            if (!overlap.isEmpty()) {
+                merged.set(index, overlap + "\n\n" + merged.get(index));
+            }
+        }
+        return merged;
+    }
+
+    private String trailingOverlap(String previous) {
+        if (previous == null || previous.isBlank() || overlapSize <= 0) {
+            return "";
+        }
+        String[] sentences = previous.split("(?<=[。！？!?；;])");
+        StringBuilder overlap = new StringBuilder();
+        for (int index = sentences.length - 1; index >= 0; index--) {
+            String sentence = sentences[index].strip();
+            if (sentence.isEmpty()) {
+                continue;
+            }
+            if (overlap.length() + sentence.length() > overlapSize) {
+                break;
+            }
+            overlap.insert(0, sentence);
+        }
+        return overlap.toString();
     }
 
     // ========================
     // 工具方法
     // ========================
 
-    private TreeAwareChunker newChunker() {
-        return new TreeAwareChunker(chunkSize, overlapSize);
+    private void checkMemoryThreshold() {
+        Runtime runtime = Runtime.getRuntime();
+        long maxMemory = runtime.maxMemory();
+        long totalMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = totalMemory - freeMemory;
+        double memoryUsage = (double) usedMemory / maxMemory;
+
+        if (memoryUsage > maxMemoryThreshold) {
+            logger.warn("内存使用率过高: {}%，触发垃圾回收", String.format("%.2f", memoryUsage * 100));
+            System.gc();
+            usedMemory = runtime.totalMemory() - runtime.freeMemory();
+            memoryUsage = (double) usedMemory / maxMemory;
+            if (memoryUsage > maxMemoryThreshold) {
+                throw new RuntimeException("内存不足，无法处理大文件。当前使用率: "
+                        + String.format("%.2f%%", memoryUsage * 100));
+            }
+        }
+    }
+
+    /**
+     * Tika 文本提取处理器：
+     * - 按段落/标题补换行，避免 DOCX 被抽成一整行后案件标题无法识别；
+     * - 把表格转成带 [TABLE] / | 分隔的文本，保留证据清单、金额表等结构；
+     * - 图片只保留 [图片] 占位，OCR 由后续扩展处理。
+     */
+    private static class StructuredTextExtractionHandler extends BodyContentHandler {
+        private final StringBuilder fullBuffer = new StringBuilder();
+        private boolean inTable;
+        private boolean cellInRow;
+
+        StructuredTextExtractionHandler() {
+            super(-1);
+        }
+
+        @Override
+        public void startElement(String uri, String localName, String qName, org.xml.sax.Attributes attributes) {
+            String name = localName == null || localName.isBlank() ? qName : localName;
+            switch (name) {
+                case "p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "li", "section" -> ensureNewline();
+                case "table" -> {
+                    ensureNewline();
+                    append("[TABLE]");
+                    ensureNewline();
+                    inTable = true;
+                }
+                case "tr" -> {
+                    if (inTable) {
+                        ensureNewline();
+                        append("| ");
+                        cellInRow = false;
+                    }
+                }
+                case "td", "th" -> {
+                    if (inTable && cellInRow) {
+                        append(" | ");
+                    }
+                    cellInRow = true;
+                }
+                case "img" -> append("[图片]");
+                default -> {
+                    // ignore other structural elements
+                }
+            }
+        }
+
+        @Override
+        public void endElement(String uri, String localName, String qName) {
+            String name = localName == null || localName.isBlank() ? qName : localName;
+            switch (name) {
+                case "p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "li", "section" -> ensureNewline();
+                case "tr" -> {
+                    if (inTable) {
+                        append(" |");
+                        ensureNewline();
+                    }
+                }
+                case "table" -> {
+                    ensureNewline();
+                    append("[/TABLE]");
+                    ensureNewline();
+                    inTable = false;
+                    cellInRow = false;
+                }
+                default -> {
+                    // ignore
+                }
+            }
+        }
+
+        @Override
+        public void characters(char[] ch, int start, int length) {
+            fullBuffer.append(ch, start, length);
+        }
+
+        private void append(String text) {
+            fullBuffer.append(text);
+        }
+
+        private void ensureNewline() {
+            if (fullBuffer.length() > 0 && fullBuffer.charAt(fullBuffer.length() - 1) != '\n') {
+                fullBuffer.append('\n');
+            }
+        }
+
+        public String getFullText() {
+            return fullBuffer.toString();
+        }
     }
 
     public record EmbeddingEstimate(long estimatedTokens, int estimatedChunkCount) {

@@ -8,6 +8,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.config.KafkaConfig;
 import com.yizhaoqi.rag.controller.UploadController;
 import com.yizhaoqi.rag.model.FileUpload;
@@ -146,6 +147,33 @@ class UploadControllerTest {
 
         assertEquals(413, response.getStatusCode().value());
         verify(uploadService, never()).uploadChunk(anyString(), anyInt(), anyLong(), anyString(), any(), anyString(), anyBoolean(), anyString());
+    }
+
+    @Test
+    void privateDocumentRejectsPublicAndForcesPrivateOrg() throws Exception {
+        MockMultipartFile file = new MockMultipartFile("file", "case.pdf", "application/pdf", "demo".getBytes());
+        when(fileTypeValidationService.validateFileType("case.pdf"))
+                .thenReturn(new FileTypeValidationService.FileTypeValidationResult(true, "ok", "PDF文档", "pdf"));
+        when(userService.isAdminUser("1")).thenReturn(true);
+        when(userService.getUserPrivateOrg("1")).thenReturn("PRIVATE_user1");
+        when(uploadService.getUploadedChunks("md5", "1")).thenReturn(List.of(0));
+        when(uploadService.getTotalChunks("md5", "1")).thenReturn(1);
+
+        var rejected = uploadController.uploadChunk(
+                "md5", 0, 1024L, "case.pdf", 1, "TEAM_A", true,
+                "PRIVATE_LEGAL", file, "1");
+
+        assertEquals(400, rejected.getStatusCode().value());
+        verify(uploadService, never()).uploadChunk(anyString(), anyInt(), anyLong(), anyString(),
+                any(), anyString(), anyBoolean(), any(DocumentType.class), anyString());
+
+        var accepted = uploadController.uploadChunk(
+                "md5", 0, 1024L, "case.pdf", 1, "TEAM_A", false,
+                "PRIVATE_LEGAL", file, "1");
+
+        assertEquals(200, accepted.getStatusCode().value());
+        verify(uploadService).uploadChunk("md5", 0, 1024L, "case.pdf", file,
+                "PRIVATE_user1", false, DocumentType.PRIVATE_LEGAL, "1");
     }
 
     @Test

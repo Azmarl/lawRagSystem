@@ -1,5 +1,6 @@
 package com.yizhaoqi.rag.controller;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.config.KafkaConfig;
 import com.yizhaoqi.rag.exception.CustomException;
 import com.yizhaoqi.rag.model.FileProcessingTask;
@@ -84,9 +85,11 @@ public class UploadController {
             @RequestParam(value = "totalChunks", required = false) Integer totalChunks,
             @RequestParam(value = "orgTag", required = false) String orgTag,
             @RequestParam(value = "isPublic", required = false, defaultValue = "false") boolean isPublic,
+            @RequestParam(value = "documentType", required = false) String documentType,
             @RequestParam("file") MultipartFile file,
             @RequestAttribute("userId") String userId) throws IOException {
-        
+
+        DocumentType resolvedDocumentType = DocumentType.from(documentType);
         LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("UPLOAD_CHUNK");
         try {
             // 文件类型验证（仅在第一个分片时进行验证）
@@ -114,10 +117,36 @@ public class UploadController {
             String fileType = getFileType(fileName);
             String contentType = file.getContentType();
             
-            LogUtils.logBusiness("UPLOAD_CHUNK", userId, "接收到分片上传请求: fileMd5=%s, chunkIndex=%d, fileName=%s, fileType=%s, contentType=%s, fileSize=%d, totalSize=%d, orgTag=%s, isPublic=%s", 
-                    fileMd5, chunkIndex, fileName, fileType, contentType, file.getSize(), totalSize, orgTag, isPublic);
-        
-            // 如果未指定组织标签，则获取用户的主组织标签
+            LogUtils.logBusiness("UPLOAD_CHUNK", userId, "接收到分片上传请求: fileMd5=%s, chunkIndex=%d, fileName=%s, fileType=%s, contentType=%s, fileSize=%d, totalSize=%d, documentType=%s, orgTag=%s, isPublic=%s",
+                    fileMd5, chunkIndex, fileName, fileType, contentType, file.getSize(), totalSize, resolvedDocumentType, orgTag, isPublic);
+
+            if (resolvedDocumentType.isPrivateDocument()) {
+                if (isPublic) {
+                    monitor.end("私人案件文档禁止公开");
+                    Map<String, Object> errorResponse = new HashMap<>();
+                    errorResponse.put("code", HttpStatus.BAD_REQUEST.value());
+                    errorResponse.put("message", "私人案件文档不允许设置为公开");
+                    return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse);
+                }
+                try {
+                    String privateOrg = userService.getUserPrivateOrg(userId);
+                    if (orgTag != null && !orgTag.isBlank() && !privateOrg.equals(orgTag)) {
+                        LogUtils.logBusiness("UPLOAD_CHUNK", userId,
+                                "私人案件文档忽略非私人组织标签: fileName=%s, requestedOrg=%s, privateOrg=%s",
+                                fileName, orgTag, privateOrg);
+                    }
+                    orgTag = privateOrg;
+                } catch (Exception e) {
+                    LogUtils.logBusinessError("UPLOAD_CHUNK", userId, "获取用户私人组织失败: fileName=%s", e, fileName);
+                    monitor.end("获取私人组织失败: " + e.getMessage());
+                    Map<String, Object> errorResponse = new HashMap<>();
+                    errorResponse.put("code", HttpStatus.INTERNAL_SERVER_ERROR.value());
+                    errorResponse.put("message", "获取用户私人组织失败: " + e.getMessage());
+                    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+                }
+            }
+
+            // 法律文档未指定组织标签时，获取用户的主组织标签
             if (orgTag == null || orgTag.isEmpty()) {
                 try {
                     LogUtils.logBusiness("UPLOAD_CHUNK", userId, "组织标签未指定，尝试获取用户主组织标签: fileName=%s", fileName);
@@ -158,7 +187,12 @@ public class UploadController {
         
             LogUtils.logFileOperation(userId, "UPLOAD_CHUNK", fileName, fileMd5, "PROCESSING");
         
-            uploadService.uploadChunk(fileMd5, chunkIndex, totalSize, fileName, file, orgTag, isPublic, userId);
+            if (resolvedDocumentType.isPrivateDocument()) {
+                uploadService.uploadChunk(fileMd5, chunkIndex, totalSize, fileName, file, orgTag, false,
+                        resolvedDocumentType, userId);
+            } else {
+                uploadService.uploadChunk(fileMd5, chunkIndex, totalSize, fileName, file, orgTag, isPublic, userId);
+            }
             
             List<Integer> uploadedChunks = uploadService.getUploadedChunks(fileMd5, userId);
             int actualTotalChunks = uploadService.getTotalChunks(fileMd5, userId);
@@ -196,6 +230,17 @@ public class UploadController {
             errorResponse.put("message", "分片上传失败: " + e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
         }
+    }
+
+    /**
+     * 向后兼容的重载（不暴露为 HTTP 映射，仅供已有调用方/测试使用）。
+     */
+    public ResponseEntity<Map<String, Object>> uploadChunk(
+            String fileMd5, int chunkIndex, long totalSize, String fileName,
+            Integer totalChunks, String orgTag, boolean isPublic,
+            MultipartFile file, String userId) throws IOException {
+        return uploadChunk(fileMd5, chunkIndex, totalSize, fileName, totalChunks, orgTag, isPublic,
+                null, file, userId);
     }
 
     /**
@@ -297,7 +342,7 @@ public class UploadController {
             if (fileUpload.getStatus() == FileUpload.STATUS_COMPLETED) {
                 LogUtils.logBusiness("MERGE_FILE", userId, "文件已完成合并，按幂等成功返回: fileMd5=%s, fileName=%s", request.fileMd5(), request.fileName());
                 monitor.end("文件已完成合并");
-                return buildAlreadyMergedResponse(request.fileMd5());
+                return buildAlreadyMergedResponse(fileUpload);
             }
 
             if (fileUpload.getStatus() == FileUpload.STATUS_MERGING) {
@@ -332,7 +377,7 @@ public class UploadController {
                 if (latestFileUpload.getStatus() == FileUpload.STATUS_COMPLETED) {
                     LogUtils.logBusiness("MERGE_FILE", userId, "文件已被其他请求合并完成，按幂等成功返回: fileMd5=%s, fileName=%s", request.fileMd5(), request.fileName());
                     monitor.end("文件已完成合并");
-                    return buildAlreadyMergedResponse(request.fileMd5());
+                    return buildAlreadyMergedResponse(latestFileUpload);
                 }
                 if (latestFileUpload.getStatus() == FileUpload.STATUS_MERGING) {
                     throw new CustomException("文件正在合并中，请稍后重试", HttpStatus.CONFLICT);
@@ -358,11 +403,12 @@ public class UploadController {
                     .orElseThrow(() -> new RuntimeException("文件记录不存在"));
 
             ParseService.EmbeddingEstimate embeddingEstimate = null;
-            try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(request.fileMd5())) {
+            try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(fileUpload)) {
                 documentSafetyService.validate(mergedFileStream);
             }
-            try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(request.fileMd5())) {
-                embeddingEstimate = parseService.estimateEmbeddingUsage(mergedFileStream);
+            try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(fileUpload)) {
+                embeddingEstimate = parseService.estimateEmbeddingUsage(
+                        mergedFileStream, fileUpload.getDocumentTypeEnum());
                 fileUpload.setEstimatedEmbeddingTokens(embeddingEstimate.estimatedTokens());
                 fileUpload.setEstimatedChunkCount(embeddingEstimate.estimatedChunkCount());
                 fileUploadRepository.save(fileUpload);
@@ -386,9 +432,10 @@ public class UploadController {
             }
 
             // 发送任务到 Kafka，包含完整的权限信息
-            LogUtils.logBusiness("MERGE_FILE", userId, "创建文件处理任务: fileMd5=%s, fileName=%s, fileType=%s, orgTag=%s, isPublic=%s", 
-                    request.fileMd5(), request.fileName(), fileType, fileUpload.getOrgTag(), fileUpload.isPublic());
-            
+            LogUtils.logBusiness("MERGE_FILE", userId, "创建文件处理任务: fileMd5=%s, fileName=%s, fileType=%s, documentType=%s, orgTag=%s, isPublic=%s",
+                    request.fileMd5(), request.fileName(), fileType, fileUpload.getDocumentType(),
+                    fileUpload.getOrgTag(), fileUpload.isPublic());
+
             FileProcessingTask task = new FileProcessingTask(
                     request.fileMd5(),
                     objectUrl,
@@ -397,7 +444,8 @@ public class UploadController {
                     fileUpload.getOrgTag(),
                     fileUpload.isPublic(),
                     FileProcessingTask.TASK_TYPE_UPLOAD_PROCESS,
-                    userId
+                    userId,
+                    fileUpload.getDocumentType()
             );
 
             fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_PROCESSING);
@@ -452,9 +500,12 @@ public class UploadController {
         }
     }
 
-    private ResponseEntity<Map<String, Object>> buildAlreadyMergedResponse(String fileMd5) throws Exception {
+    private ResponseEntity<Map<String, Object>> buildAlreadyMergedResponse(FileUpload fileUpload) throws Exception {
         Map<String, Object> data = new HashMap<>();
-        data.put("object_url", uploadService.generateMergedObjectUrl(fileMd5));
+        String objectUrl = fileUpload.getStorageBucket() != null && !fileUpload.getStorageBucket().isBlank()
+                ? uploadService.generateMergedObjectUrl(fileUpload)
+                : uploadService.generateMergedObjectUrl(fileUpload.getFileMd5());
+        data.put("object_url", objectUrl);
 
         Map<String, Object> response = new HashMap<>();
         response.put("code", 200);

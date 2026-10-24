@@ -1,5 +1,6 @@
 package com.yizhaoqi.rag.controller;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.service.ParseService;
 import com.yizhaoqi.rag.utils.LogUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,6 +18,7 @@ public class ParseController {
     @PostMapping
     public ResponseEntity<String> parseDocument(@RequestParam("file") MultipartFile file,
                                                 @RequestParam("file_md5") String fileMd5,
+                                                @RequestParam(value = "documentType", required = false) String documentType,
                                                 @RequestAttribute(value = "userId", required = false) String userId) {
         LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("PARSE_DOCUMENT");
         try {
@@ -24,7 +26,8 @@ public class ParseController {
                     "开始解析文档: fileMd5=%s, fileName=%s, fileSize=%d", 
                     fileMd5, file.getOriginalFilename(), file.getSize());
             
-            parseService.parseAndSave(fileMd5, file.getInputStream());
+            parseService.parseAndSave(fileMd5, file.getInputStream(), userId, "DEFAULT", false,
+                    DocumentType.from(documentType));
             
             LogUtils.logFileOperation(userId != null ? userId : "system", "PARSE", 
                     file.getOriginalFilename(), fileMd5, "SUCCESS");

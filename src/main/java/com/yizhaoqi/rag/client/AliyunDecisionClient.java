@@ -25,12 +25,13 @@ public class AliyunDecisionClient {
     private final String model;
     private final Duration timeout;
     private final ObjectMapper objectMapper;
+    private final boolean configured;
 
     public AliyunDecisionClient(
-            @Value("${aliyun.decision.api.url:https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone}") String apiUrl,
+            @Value("${aliyun.decision.api.url:https://ai-gateway.edgeone.link/v1/systemone}") String apiUrl,
             @Value("${aliyun.decision.api.key:}") String apiKey,
-            @Value("${aliyun.decision.api.model:}") String model,
-            @Value("${aliyun.decision.api.timeout-ms:500}") long timeoutMs,
+            @Value("${aliyun.decision.api.model:@makers/jev}") String model,
+            @Value("${aliyun.decision.api.timeout-ms:2000}") long timeoutMs,
             ObjectMapper objectMapper) {
         WebClient.Builder builder = WebClient.builder().baseUrl(apiUrl);
         if (apiKey != null && !apiKey.isBlank()) {
@@ -38,12 +39,21 @@ public class AliyunDecisionClient {
         }
         this.webClient = builder.build();
         this.model = model;
+        this.configured = apiKey != null && !apiKey.isBlank() && model != null && !model.isBlank();
         this.timeout = Duration.ofMillis(Math.max(100, timeoutMs));
         this.objectMapper = objectMapper;
+        logger.info("决策模型配置: enabled={}, endpoint={}, model={}", configured, apiUrl, model);
+    }
+
+    /**
+     * 未配置 API Key 时不发起网络调用，由调用方走规则兜底。
+     */
+    public boolean isConfigured() {
+        return configured;
     }
 
     public DecisionResult classify(String query, String pageContext, List<String> historyTags) {
-        if (model == null || model.isBlank()) {
+        if (!configured) {
             return DecisionResult.unavailable();
         }
 
@@ -78,7 +88,7 @@ public class AliyunDecisionClient {
                     .bodyToMono(String.class)
                     .timeout(timeout)
                     .onErrorResume(error -> {
-                        logger.warn("阿里云决策模型调用失败: {}", error.getMessage());
+                        logger.warn("决策模型调用失败: {}", error.getMessage());
                         return Mono.empty();
                     })
                     .block();
@@ -86,17 +96,66 @@ public class AliyunDecisionClient {
                 return DecisionResult.unavailable();
             }
             JsonNode root = objectMapper.readTree(body);
-            JsonNode decision = root.path("answers").path("search_scope");
-            String category = decision.path("choice").asText("").toUpperCase();
-            double confidence = decision.path("confidence").asDouble(0.0);
+            JsonNode decision = firstPresent(
+                    root.path("answers").path("search_scope"),
+                    root.path("answer").path("search_scope"),
+                    root.path("data").path("answers").path("search_scope"),
+                    root.path("data"),
+                    root.path("result")
+            );
+            String category = firstText(decision,
+                    "choice", "category", "search_scope", "answer", "value").toUpperCase();
+            double confidence = firstDouble(decision, 0.9, "confidence", "score", "probability");
             if (!SetOfCategories.contains(category)) {
                 return DecisionResult.unavailable();
             }
             return new DecisionResult(category, Math.max(0.0, Math.min(1.0, confidence)), true);
         } catch (Exception error) {
-            logger.warn("解析阿里云决策模型结果失败: {}", error.getMessage());
+            logger.warn("解析决策模型结果失败: {}", error.getMessage());
             return DecisionResult.unavailable();
         }
+    }
+
+    private JsonNode firstPresent(JsonNode... nodes) {
+        for (JsonNode node : nodes) {
+            if (node != null && !node.isMissingNode() && !node.isNull() && !node.isEmpty()) {
+                return node;
+            }
+        }
+        return com.fasterxml.jackson.databind.node.MissingNode.getInstance();
+    }
+
+    private String firstText(JsonNode node, String... fields) {
+        if (node == null || node.isMissingNode()) {
+            return "";
+        }
+        for (String field : fields) {
+            JsonNode value = node.path(field);
+            if (value.isTextual() && !value.asText().isBlank()) {
+                return value.asText().trim();
+            }
+        }
+        return node.isTextual() ? node.asText().trim() : "";
+    }
+
+    private double firstDouble(JsonNode node, double fallback, String... fields) {
+        if (node == null || node.isMissingNode()) {
+            return fallback;
+        }
+        for (String field : fields) {
+            JsonNode value = node.path(field);
+            if (value.isNumber()) {
+                return value.asDouble();
+            }
+            if (value.isTextual()) {
+                try {
+                    return Double.parseDouble(value.asText());
+                } catch (NumberFormatException ignored) {
+                    // 继续尝试下一个字段
+                }
+            }
+        }
+        return fallback;
     }
 
     private String safe(String value) {

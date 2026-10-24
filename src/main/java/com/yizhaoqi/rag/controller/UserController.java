@@ -321,14 +321,42 @@ public class UserController {
         try {
             LogUtils.logBusiness("GET_UPLOAD_ORG_TAGS", userId, "获取用户上传组织标签信息");
             
-            // 获取用户所有组织标签
-            List<String> orgTags = Arrays.asList(userService.getUserOrgTags(userId).get("orgTags").toString().split(","));
+            // 获取用户所有组织标签（token 中的 userId 是数据库主键，需先解析 username）
+            User currentUser;
+            try {
+                currentUser = userRepository.findById(Long.parseLong(userId))
+                        .orElseThrow(() -> new CustomException("User not found", HttpStatus.NOT_FOUND));
+            } catch (NumberFormatException ignored) {
+                currentUser = userRepository.findByUsername(userId)
+                        .orElseThrow(() -> new CustomException("User not found", HttpStatus.NOT_FOUND));
+            }
+            Object orgTagsValue = userService.getUserOrgTags(currentUser.getUsername()).get("orgTags");
+            List<String> orgTags;
+            if (orgTagsValue instanceof java.util.Collection<?> collection) {
+                orgTags = collection.stream().map(String::valueOf).filter(tag -> !tag.isBlank()).toList();
+            } else if (orgTagsValue != null) {
+                orgTags = Arrays.stream(orgTagsValue.toString().replace("[", "").replace("]", "").split(","))
+                        .map(String::trim)
+                        .filter(tag -> !tag.isEmpty())
+                        .toList();
+            } else {
+                orgTags = List.of();
+            }
             // 获取用户主组织标签
             String primaryOrg = userService.getUserPrimaryOrg(userId);
-            
+            // 私人案件文档默认归属用户私人组织
+            String privateOrg = userService.getUserPrivateOrg(userId);
+
             Map<String, Object> responseData = new HashMap<>();
             responseData.put("orgTags", orgTags);
             responseData.put("primaryOrg", primaryOrg);
+            responseData.put("privateOrgTag", privateOrg);
+            responseData.put("documentTypes", List.of(
+                    Map.of("value", "STRUCTURED_LAW", "label", "法律文档",
+                            "allowPublic", true, "defaultOrgTag", primaryOrg),
+                    Map.of("value", "PRIVATE_LEGAL", "label", "私人案件文档",
+                            "allowPublic", false, "defaultOrgTag", privateOrg)
+            ));
             
             LogUtils.logUserOperation(userId, "GET_UPLOAD_ORG_TAGS", "upload_organizations", "SUCCESS");
             monitor.end("获取上传组织标签成功");

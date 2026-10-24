@@ -16,19 +16,21 @@ provide('retrievalDrawerState', retrievalDrawerState);
 </script>
 
 <template>
-  <div v-if="showReferencePreview" class="h-full">
-    <ReferencePreviewPage />
-  </div>
-  <div v-else class="flex h-full gap-0">
-    <ConversationSidebar />
-    <div class="flex min-w-0 flex-1 flex-col bg-white dark:bg-[#1c1c1c]">
-      <ChatList />
-      <InputBox />
+  <div class="h-full">
+    <div v-if="showReferencePreview" class="h-full">
+      <ReferencePreviewPage />
     </div>
-  </div>
+    <div v-else class="flex h-full gap-0">
+      <ConversationSidebar />
+      <div class="flex min-w-0 flex-1 flex-col bg-white dark:bg-[#1c1c1c]">
+        <ChatList />
+        <InputBox />
+      </div>
+    </div>
 
-  <!-- Phase 4: 检索溯源抽屉 (Teleport to body, 页面级) -->
-  <RetrievalTraceDrawer />
+    <!-- Phase 4: 检索溯源抽屉 (Teleport to body, 页面级) -->
+    <RetrievalTraceDrawer />
+  </div>
 </template>
 
 <style scoped></style>

@@ -20,6 +20,8 @@ const drawerState = inject<any>('retrievalDrawerState', null);
 /**
  * 从 referenceMappings 合成 retrievalResults（用于重连/历史加载后的数据恢复）。
  */
+// 引用字段较多，保持平铺映射便于和 ReferenceEvidence 对齐
+// eslint-disable-next-line complexity
 function buildRetrievalResultItem(
   ref: Record<string, any>,
   key: number
@@ -41,7 +43,19 @@ function buildRetrievalResultItem(
     partName: ref.partName ?? null,
     chapterName: ref.chapterName ?? null,
     sectionName: ref.sectionName ?? null,
-    articleId: ref.articleId ?? null
+    articleId: ref.articleId ?? null,
+    documentType: ref.documentType ?? null,
+    chunkStrategy: ref.chunkStrategy ?? null,
+    caseSection: ref.caseSection ?? null,
+    blockId: ref.blockId ?? null,
+    parentBlockId: ref.parentBlockId ?? null,
+    contextText: ref.contextText ?? null,
+    contentType: ref.contentType ?? null,
+    searchScope: ref.searchScope ?? null,
+    intentCategory: ref.intentCategory ?? null,
+    intentConfidence: ref.intentConfidence ?? null,
+    intentReason: ref.intentReason ?? null,
+    sourceCorpus: ref.sourceCorpus ?? null
   }
 }
 
@@ -287,7 +301,7 @@ async function handleSourceFileClick(fileInfo: {
         <SystemLogo class="text-6 text-white" />
       </NAvatar>
       <div class="flex-col gap-1">
-        <NText class="text-4 font-bold">律法知识检索系统</NText>
+        <NText class="text-4 font-bold">律法检索系统</NText>
         <NText class="text-3 color-gray-500">{{ formatDate(msg.timestamp) }}</NText>
       </div>
     </div>

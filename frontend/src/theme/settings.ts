@@ -22,7 +22,7 @@ export const themeSettings: App.Theme.ThemeSetting = {
     mixChildMenuWidth: 200
   },
   footer: { visible: false, fixed: false, height: 48, right: true },
-  watermark: { visible: false, text: '律法知识检索系统' },
+  watermark: { visible: false, text: '律法检索系统' },
   tokens: {
     light: {
       colors: {

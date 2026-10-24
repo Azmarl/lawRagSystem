@@ -47,6 +47,11 @@ public class EsDocument {
     private String documentType;
     private String parentBlockId;
     private Integer chunkPosition;
+    private String chunkStrategy;
+    private String caseSection;
+    private String blockId;
+    private String chunkRole;
+    private String contentType;
 
     /**
      * 默认构造函数，用于Jackson反序列化

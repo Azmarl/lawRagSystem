@@ -87,6 +87,39 @@ public class ElasticsearchService {
         }
     }
 
+    /**
+     * 只删除公开法典索引中的分块，不触碰私人案件索引。
+     */
+    public void deletePublicByFileMd5(String fileMd5) {
+        try {
+            DeleteByQueryRequest request = DeleteByQueryRequest.of(d -> d
+                    .index(PUBLIC_INDEX)
+                    .query(q -> q.term(t -> t.field("fileMd5").value(fileMd5)))
+            );
+            esClient.deleteByQuery(request);
+        } catch (Exception e) {
+            throw new RuntimeException("删除公开文档失败", e);
+        }
+    }
+
+    /**
+     * 只删除某个用户在私人索引中的分块，避免相同 MD5 的不同用户互相删除。
+     */
+    public void deletePrivateByFileMd5AndUserId(String fileMd5, String userId) {
+        try {
+            DeleteByQueryRequest request = DeleteByQueryRequest.of(d -> d
+                    .index(PRIVATE_INDEX)
+                    .query(q -> q.bool(b -> b
+                            .must(m -> m.term(t -> t.field("fileMd5").value(fileMd5)))
+                            .must(m -> m.term(t -> t.field("userId").value(userId)))
+                    ))
+            );
+            esClient.deleteByQuery(request);
+        } catch (Exception e) {
+            throw new RuntimeException("删除私人文档失败", e);
+        }
+    }
+
     public long countByFileMd5(String fileMd5) {
         try {
             CountResponse response = esClient.count(c -> c
@@ -100,7 +133,8 @@ public class ElasticsearchService {
     }
 
     private boolean isPrivate(EsDocument document) {
+        // 显式类型优先；chunkLevel=private 仅为兼容私人分块策略早期版本的数据
         return "PRIVATE_LEGAL".equals(document.getDocumentType())
-                || "private".equals(document.getChunkLevel());
+                || ("private".equals(document.getChunkLevel()) && document.getDocumentType() == null);
     }
 }

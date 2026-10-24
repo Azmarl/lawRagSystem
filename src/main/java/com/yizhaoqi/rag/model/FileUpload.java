@@ -1,5 +1,6 @@
 package com.yizhaoqi.rag.model;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import jakarta.persistence.*;
 import lombok.Data;
 import org.hibernate.annotations.CreationTimestamp;
@@ -73,6 +74,25 @@ public class FileUpload {
     @Column(name = "is_public", nullable = false)
     private boolean isPublic = false;
 
+    /**
+     * 文档类型：STRUCTURED_LAW（法律文档） / PRIVATE_LEGAL（私人案件文档）。
+     * 历史数据可能为 null，此时按法律文档处理。
+     */
+    @Column(name = "document_type", length = 32)
+    private String documentType;
+
+    /**
+     * 原始文件所在的 MinIO bucket。私人案件文档使用独立 bucket，与公开法典隔离。
+     */
+    @Column(name = "storage_bucket", length = 128)
+    private String storageBucket;
+
+    /**
+     * 合并后文件所在的 MinIO object key。
+     */
+    @Column(name = "storage_object_key", length = 512)
+    private String storageObjectKey;
+
     @Column(name = "estimated_embedding_tokens")
     private Long estimatedEmbeddingTokens;
 
@@ -104,4 +124,27 @@ public class FileUpload {
      */
     @UpdateTimestamp
     private LocalDateTime mergedAt;
+
+    public DocumentType getDocumentTypeEnum() {
+        return DocumentType.from(documentType);
+    }
+
+    public boolean isPrivateDocument() {
+        return getDocumentTypeEnum().isPrivateDocument();
+    }
+
+    public void setDocumentTypeEnum(DocumentType type) {
+        this.documentType = type == null ? DocumentType.STRUCTURED_LAW.name() : type.name();
+    }
+
+    @PrePersist
+    @PreUpdate
+    void normalizeDocumentType() {
+        if (documentType == null || documentType.isBlank()) {
+            documentType = DocumentType.STRUCTURED_LAW.name();
+        }
+        if (isPrivateDocument()) {
+            isPublic = false;
+        }
+    }
 }

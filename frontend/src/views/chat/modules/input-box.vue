@@ -248,7 +248,7 @@ const handShortcut = (e: KeyboardEvent) => {
       <textarea
         ref="inputRef"
         v-model.trim="input.message"
-        placeholder="给 律法知识检索系统 发送消息，Enter 发送，Shift+Enter 换行"
+        placeholder="给 律法检索系统 发送消息，Enter 发送，Shift+Enter 换行"
         class="min-h-6 max-h-32 w-full flex-1 resize-none border-none bg-transparent py-1 text-14px color-#333 caret-[rgb(var(--primary-color))] outline-none placeholder:text-#bbb dark:color-#e1e1e1 dark:placeholder:text-#555"
         @keydown="handShortcut"
       />

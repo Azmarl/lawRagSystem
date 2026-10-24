@@ -1,11 +1,13 @@
 package com.yizhaoqi.rag.service;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.config.MinioConfig;
 import com.yizhaoqi.rag.exception.CustomException;
 import com.yizhaoqi.rag.model.ChunkInfo;
 import com.yizhaoqi.rag.model.FileUpload;
 import com.yizhaoqi.rag.repository.ChunkInfoRepository;
 import com.yizhaoqi.rag.repository.FileUploadRepository;
+import com.yizhaoqi.rag.utils.UploadChunkKey;
 import io.micrometer.common.util.StringUtils;
 import io.minio.*;
 import io.minio.http.Method;
@@ -54,8 +56,11 @@ public class UploadService {
     @Autowired
     private MinioConfig minioConfig;
 
+    @Autowired
+    private DocumentStorageService documentStorageService;
+
     /**
-     * 上传文件分片
+     * 上传文件分片（向后兼容：默认按法律文档处理）
      *
      * @param fileMd5 文件的 MD5 值，用于唯一标识文件
      * @param chunkIndex 分片索引，表示这是文件的第几个分片
@@ -67,18 +72,33 @@ public class UploadService {
      * @param userId 上传用户ID
      * @throws IOException 如果文件读取失败
      */
-    public void uploadChunk(String fileMd5, int chunkIndex, long totalSize, String fileName, 
+    public void uploadChunk(String fileMd5, int chunkIndex, long totalSize, String fileName,
                            MultipartFile file, String orgTag, boolean isPublic, String userId) throws IOException {
-        // 获取文件类型信息
+        uploadChunk(fileMd5, chunkIndex, totalSize, fileName, file, orgTag, isPublic,
+                DocumentType.STRUCTURED_LAW, userId);
+    }
+
+    /**
+     * 上传文件分片（携带文档类型）。
+     *
+     * <p>私人案件文档写入独立 bucket/前缀，并使用按用户隔离的分片键，避免不同用户上传同一文件时
+     * 在 chunk_info 的唯一约束上互相覆盖。</p>
+     */
+    public void uploadChunk(String fileMd5, int chunkIndex, long totalSize, String fileName,
+                           MultipartFile file, String orgTag, boolean isPublic,
+                           DocumentType documentType, String userId) throws IOException {
+        DocumentType resolvedType = documentType == null ? DocumentType.STRUCTURED_LAW : documentType;
         String fileType = getFileType(fileName);
         String contentType = file.getContentType();
-        
-        logger.info("[uploadChunk] 开始处理分片上传请求 => fileMd5: {}, chunkIndex: {}, totalSize: {}, fileName: {}, fileType: {}, contentType: {}, fileSize: {}, orgTag: {}, isPublic: {}, userId: {}", 
-                   fileMd5, chunkIndex, totalSize, fileName, fileType, contentType, file.getSize(), orgTag, isPublic, userId);
-        
+
+        logger.info("[uploadChunk] 开始处理分片上传请求 => fileMd5: {}, chunkIndex: {}, totalSize: {}, fileName: {}, fileType: {}, contentType: {}, fileSize: {}, orgTag: {}, isPublic: {}, documentType: {}, userId: {}",
+                fileMd5, chunkIndex, totalSize, fileName, fileType, contentType, file.getSize(), orgTag, isPublic, resolvedType, userId);
+
         try {
-            FileUpload fileUpload = getOrCreateFileUpload(fileMd5, totalSize, fileName, orgTag, isPublic, userId, fileType);
-            logger.debug("检查文件记录是否存在 => fileMd5: {}, fileName: {}, fileType: {}, status: {}", fileMd5, fileName, fileType, fileUpload.getStatus());
+            FileUpload fileUpload = getOrCreateFileUpload(fileMd5, totalSize, fileName, orgTag, isPublic,
+                    resolvedType, userId, fileType);
+            logger.debug("检查文件记录是否存在 => fileMd5: {}, fileName: {}, fileType: {}, documentType: {}, status: {}",
+                    fileMd5, fileName, fileType, fileUpload.getDocumentType(), fileUpload.getStatus());
 
             if (fileUpload.getStatus() == FileUpload.STATUS_MERGING) {
                 throw new CustomException("文件正在合并中，请稍后重试", HttpStatus.CONFLICT);
@@ -88,18 +108,21 @@ public class UploadService {
             }
 
             // Redis Bitmap 是上传进度快路径；数据库是最终可合并的事实来源。
-            boolean chunkUploaded = isChunkUploaded(fileMd5, chunkIndex, userId);
-            logger.debug("检查分片是否已上传 => fileMd5: {}, fileName: {}, chunkIndex: {}, isUploaded: {}", 
-                      fileMd5, fileName, chunkIndex, chunkUploaded);
+            boolean chunkUploaded = isChunkUploaded(fileMd5, chunkIndex, userId, resolvedType);
+            logger.debug("检查分片是否已上传 => fileMd5: {}, fileName: {}, chunkIndex: {}, isUploaded: {}",
+                    fileMd5, fileName, chunkIndex, chunkUploaded);
 
             if (chunkUploaded) {
-                logger.info("分片已在Redis中标记为已上传，按幂等成功处理 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}", fileMd5, fileName, fileType, chunkIndex);
+                logger.info("分片已在Redis中标记为已上传，按幂等成功处理 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}",
+                        fileMd5, fileName, fileType, chunkIndex);
                 return;
             }
 
-            if (chunkInfoRepository.existsByFileMd5AndChunkIndex(fileMd5, chunkIndex)) {
-                logger.info("Redis未命中但数据库已有分片信息，回填Redis后按幂等成功处理 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
-                markChunkUploadedQuietly(fileMd5, chunkIndex, userId, fileName);
+            String chunkKey = UploadChunkKey.of(fileMd5, userId, resolvedType);
+            if (chunkInfoRepository.existsByFileMd5AndChunkIndex(chunkKey, chunkIndex)) {
+                logger.info("Redis未命中但数据库已有分片信息，回填Redis后按幂等成功处理 => chunkKey: {}, fileName: {}, chunkIndex: {}",
+                        chunkKey, fileName, chunkIndex);
+                markChunkUploadedQuietly(fileMd5, chunkIndex, userId, fileName, resolvedType);
                 return;
             }
 
@@ -107,50 +130,41 @@ public class UploadService {
             byte[] fileBytes = file.getBytes();
             String chunkMd5 = DigestUtils.md5Hex(fileBytes);
             logger.debug("分片MD5计算完成 => fileMd5: {}, fileName: {}, chunkIndex: {}, chunkMd5: {}",
-                       fileMd5, fileName, chunkIndex, chunkMd5);
+                    fileMd5, fileName, chunkIndex, chunkMd5);
 
-            String storagePath = "chunks/" + fileMd5 + "/" + chunkIndex;
+            String storagePath = documentStorageService.chunkObjectKey(fileUpload, chunkIndex);
             logger.debug("构建分片存储路径 => fileName: {}, path: {}", fileName, storagePath);
 
             try {
-                logger.info("开始上传分片到MinIO => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, bucket: uploads, path: {}, size: {}, contentType: {}",
-                          fileMd5, fileName, fileType, chunkIndex, storagePath, file.getSize(), contentType);
-
-                PutObjectArgs putObjectArgs = PutObjectArgs.builder()
-                        .bucket("uploads")
-                        .object(storagePath)
-                        .stream(file.getInputStream(), file.getSize(), -1)
-                        .contentType(file.getContentType())
-                        .build();
-
-                minioClient.putObject(putObjectArgs);
+                logger.info("开始上传分片到MinIO => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, bucket: {}, path: {}, size: {}",
+                        fileMd5, fileName, fileType, chunkIndex, fileUpload.getStorageBucket(), storagePath, file.getSize());
+                documentStorageService.uploadChunk(fileUpload, chunkIndex, file);
                 logger.info("分片上传到MinIO成功 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}", fileMd5, fileName, fileType, chunkIndex);
             } catch (Exception e) {
                 logger.error("分片上传到MinIO失败 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, 错误类型: {}, 错误信息: {}",
-                          fileMd5, fileName, fileType, chunkIndex, e.getClass().getName(), e.getMessage(), e);
+                        fileMd5, fileName, fileType, chunkIndex, e.getClass().getName(), e.getMessage(), e);
 
-                if (e instanceof io.minio.errors.ErrorResponseException) {
-                    io.minio.errors.ErrorResponseException ere = (io.minio.errors.ErrorResponseException) e;
+                if (e instanceof io.minio.errors.ErrorResponseException ere) {
                     logger.error("MinIO错误响应详情 => fileName: {}, code: {}, message: {}, resource: {}, requestId: {}",
-                             fileName, ere.errorResponse().code(), ere.errorResponse().message(),
-                             ere.errorResponse().resource(), ere.errorResponse().requestId());
+                            fileName, ere.errorResponse().code(), ere.errorResponse().message(),
+                            ere.errorResponse().resource(), ere.errorResponse().requestId());
                 }
 
                 throw new RuntimeException("上传分片到MinIO失败: " + e.getMessage(), e);
             }
 
-            logger.debug("保存分片信息到数据库 => fileMd5: {}, fileName: {}, chunkIndex: {}, chunkMd5: {}, storagePath: {}",
-                      fileMd5, fileName, chunkIndex, chunkMd5, storagePath);
-            saveChunkInfo(fileMd5, chunkIndex, chunkMd5, storagePath);
-            logger.info("分片信息已保存到数据库 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
+            logger.debug("保存分片信息到数据库 => chunkKey: {}, chunkIndex: {}, chunkMd5: {}, storagePath: {}",
+                    chunkKey, chunkIndex, chunkMd5, storagePath);
+            saveChunkInfo(chunkKey, chunkIndex, chunkMd5, storagePath);
+            logger.info("分片信息已保存到数据库 => fileMd5: {}, chunkIndex: {}", fileMd5, chunkIndex);
 
-            markChunkUploadedQuietly(fileMd5, chunkIndex, userId, fileName);
-            
+            markChunkUploadedQuietly(fileMd5, chunkIndex, userId, fileName, resolvedType);
+
             logger.info("分片处理完成 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}", fileMd5, fileName, fileType, chunkIndex);
         } catch (Exception e) {
-            logger.error("分片上传过程中发生错误 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, 错误类型: {}, 错误信息: {}", 
-                       fileMd5, fileName, fileType, chunkIndex, e.getClass().getName(), e.getMessage(), e);
-            throw e; // 重新抛出异常供上层处理
+            logger.error("分片上传过程中发生错误 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, 错误类型: {}, 错误信息: {}",
+                    fileMd5, fileName, fileType, chunkIndex, e.getClass().getName(), e.getMessage(), e);
+            throw e;
         }
     }
 
@@ -261,13 +275,18 @@ public class UploadService {
      * @return 分片是否已上传
      */
     public boolean isChunkUploaded(String fileMd5, int chunkIndex, String userId) {
-        logger.debug("检查分片是否已上传 => fileMd5: {}, chunkIndex: {}, userId: {}", fileMd5, chunkIndex, userId);
+        return isChunkUploaded(fileMd5, chunkIndex, userId, resolveDocumentType(fileMd5, userId));
+    }
+
+    public boolean isChunkUploaded(String fileMd5, int chunkIndex, String userId, DocumentType documentType) {
+        logger.debug("检查分片是否已上传 => fileMd5: {}, chunkIndex: {}, userId: {}, documentType: {}",
+                fileMd5, chunkIndex, userId, documentType);
         try {
             if (chunkIndex < 0) {
                 logger.error("无效的分片索引 => fileMd5: {}, chunkIndex: {}", fileMd5, chunkIndex);
                 throw new IllegalArgumentException("chunkIndex must be non-negative");
             }
-            String redisKey = "upload:" + userId + ":" + fileMd5;
+            String redisKey = uploadRedisKey(fileMd5, userId, documentType);
             boolean isUploaded = redisTemplate.opsForValue().getBit(redisKey, chunkIndex);
             logger.debug("分片上传状态 => fileMd5: {}, chunkIndex: {}, userId: {}, isUploaded: {}", 
                       fileMd5, chunkIndex, userId, isUploaded);
@@ -287,13 +306,18 @@ public class UploadService {
      * @param userId 用户ID
      */
     public void markChunkUploaded(String fileMd5, int chunkIndex, String userId) {
-        logger.debug("标记分片为已上传 => fileMd5: {}, chunkIndex: {}, userId: {}", fileMd5, chunkIndex, userId);
+        markChunkUploaded(fileMd5, chunkIndex, userId, resolveDocumentType(fileMd5, userId));
+    }
+
+    public void markChunkUploaded(String fileMd5, int chunkIndex, String userId, DocumentType documentType) {
+        logger.debug("标记分片为已上传 => fileMd5: {}, chunkIndex: {}, userId: {}, documentType: {}",
+                fileMd5, chunkIndex, userId, documentType);
         try {
             if (chunkIndex < 0) {
                 logger.error("无效的分片索引 => fileMd5: {}, chunkIndex: {}", fileMd5, chunkIndex);
                 throw new IllegalArgumentException("chunkIndex must be non-negative");
             }
-            String redisKey = "upload:" + userId + ":" + fileMd5;
+            String redisKey = uploadRedisKey(fileMd5, userId, documentType);
             redisTemplate.opsForValue().setBit(redisKey, chunkIndex, true);
             logger.debug("分片已标记为已上传 => fileMd5: {}, chunkIndex: {}, userId: {}", fileMd5, chunkIndex, userId);
         } catch (Exception e) {
@@ -310,9 +334,14 @@ public class UploadService {
      * @param userId 用户ID
      */
     public void deleteFileMark(String fileMd5, String userId) {
-        logger.debug("删除文件所有分片上传标记 => fileMd5: {}, userId: {}", fileMd5, userId);
+        deleteFileMark(fileMd5, userId, resolveDocumentType(fileMd5, userId));
+    }
+
+    public void deleteFileMark(String fileMd5, String userId, DocumentType documentType) {
+        logger.debug("删除文件所有分片上传标记 => fileMd5: {}, userId: {}, documentType: {}",
+                fileMd5, userId, documentType);
         try {
-            String redisKey = "upload:" + userId + ":" + fileMd5;
+            String redisKey = uploadRedisKey(fileMd5, userId, documentType);
             redisTemplate.delete(redisKey);
             logger.info("文件分片上传标记已删除 => fileMd5: {}, userId: {}", fileMd5, userId);
         } catch (Exception e) {
@@ -341,17 +370,18 @@ public class UploadService {
                 return uploadedChunks;
             }
             
-            // 优化：一次性获取所有分片状态
-            String redisKey = "upload:" + userId + ":" + fileMd5;
+            // 优化：一次性获取所有分片状态（私人文件按 scoped chunk key 隔离）
+            DocumentType documentType = resolveDocumentType(fileMd5, userId);
+            String redisKey = uploadRedisKey(fileMd5, userId, documentType);
             byte[] bitmapData = redisTemplate.execute((RedisCallback<byte[]>) connection -> {
                 return connection.get(redisKey.getBytes());
             });
             
             if (bitmapData == null) {
                 logger.info("Redis中无分片状态记录 => fileMd5: {}, userId: {}", fileMd5, userId);
-                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5);
+                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5, userId);
                 if (!dbUploadedChunks.isEmpty()) {
-                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId);
+                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId, documentType);
                     logger.info("已从数据库回填Redis分片状态 => fileMd5: {}, userId: {}, 已上传数量: {}",
                               fileMd5, userId, dbUploadedChunks.size());
                 }
@@ -360,9 +390,9 @@ public class UploadService {
 
             if (bitmapData.length == 0) {
                 logger.info("Redis中分片状态为空，尝试从数据库回源 => fileMd5: {}, userId: {}", fileMd5, userId);
-                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5);
+                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5, userId);
                 if (!dbUploadedChunks.isEmpty()) {
-                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId);
+                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId, documentType);
                 }
                 return dbUploadedChunks;
             }
@@ -375,9 +405,9 @@ public class UploadService {
             }
 
             if (uploadedChunks.isEmpty()) {
-                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5);
+                List<Integer> dbUploadedChunks = getUploadedChunksFromDatabase(fileMd5, userId);
                 if (!dbUploadedChunks.isEmpty()) {
-                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId);
+                    backfillUploadedChunks(fileMd5, dbUploadedChunks, userId, documentType);
                     logger.info("Redis无有效分片位，已从数据库回填 => fileMd5: {}, userId: {}, 已上传数量: {}",
                               fileMd5, userId, dbUploadedChunks.size());
                     return dbUploadedChunks;
@@ -394,28 +424,49 @@ public class UploadService {
         }
     }
 
-    private List<Integer> getUploadedChunksFromDatabase(String fileMd5) {
-        logger.debug("从数据库查询已上传分片列表 => fileMd5: {}", fileMd5);
-        return chunkInfoRepository.findChunkIndexesByFileMd5(fileMd5);
+    private List<Integer> getUploadedChunksFromDatabase(String fileMd5, String userId) {
+        String chunkKey = UploadChunkKey.of(fileMd5, userId, resolveDocumentType(fileMd5, userId));
+        logger.debug("从数据库查询已上传分片列表 => fileMd5: {}, chunkKey: {}", fileMd5, chunkKey);
+        return chunkInfoRepository.findChunkIndexesByFileMd5(chunkKey);
     }
 
-    private void backfillUploadedChunks(String fileMd5, List<Integer> uploadedChunks, String userId) {
+    private DocumentType resolveDocumentType(String fileMd5, String userId) {
+        return fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
+                .map(FileUpload::getDocumentTypeEnum)
+                .orElse(DocumentType.STRUCTURED_LAW);
+    }
+
+    private void backfillUploadedChunks(String fileMd5, List<Integer> uploadedChunks, String userId,
+            DocumentType documentType) {
         for (Integer chunkIndex : uploadedChunks) {
             if (chunkIndex != null && chunkIndex >= 0) {
-                markChunkUploadedQuietly(fileMd5, chunkIndex, userId, "unknown");
+                markChunkUploadedQuietly(fileMd5, chunkIndex, userId, "unknown", documentType);
             }
         }
     }
 
     private void markChunkUploadedQuietly(String fileMd5, int chunkIndex, String userId, String fileName) {
+        markChunkUploadedQuietly(fileMd5, chunkIndex, userId, fileName, resolveDocumentType(fileMd5, userId));
+    }
+
+    private void markChunkUploadedQuietly(String fileMd5, int chunkIndex, String userId, String fileName,
+            DocumentType documentType) {
         try {
-            logger.debug("标记分片为已上传 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
-            markChunkUploaded(fileMd5, chunkIndex, userId);
+            logger.debug("标记分片为已上传 => fileMd5: {}, fileName: {}, chunkIndex: {}, documentType: {}",
+                    fileMd5, fileName, chunkIndex, documentType);
+            markChunkUploaded(fileMd5, chunkIndex, userId, documentType);
             logger.debug("分片标记完成 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
         } catch (Exception e) {
             logger.error("标记分片已上传失败，数据库仍作为事实来源 => fileMd5: {}, fileName: {}, chunkIndex: {}, 错误: {}",
                       fileMd5, fileName, chunkIndex, e.getMessage(), e);
         }
+    }
+
+    private String uploadRedisKey(String fileMd5, String userId, DocumentType documentType) {
+        if (documentType != null && documentType.isPrivateDocument()) {
+            return "upload:" + userId + ":" + UploadChunkKey.of(fileMd5, userId, documentType);
+        }
+        return "upload:" + userId + ":" + fileMd5;
     }
 
     /**
@@ -513,147 +564,209 @@ public class UploadService {
         String fileType = getFileType(fileName);
         logger.info("开始合并文件分片 => fileMd5: {}, fileName: {}, fileType: {}, userId: {}", fileMd5, fileName, fileType, userId);
         try {
-            // 查询所有分片信息
-            logger.debug("查询分片信息 => fileMd5: {}, fileName: {}", fileMd5, fileName);
-            List<ChunkInfo> chunks = chunkInfoRepository.findByFileMd5OrderByChunkIndexAsc(fileMd5);
-            logger.info("查询到分片信息 => fileMd5: {}, fileName: {}, fileType: {}, 分片数量: {}", fileMd5, fileName, fileType, chunks.size());
-            
-            // 检查分片数量是否与预期一致
+            FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
+                    .orElseThrow(() -> {
+                        logger.error("更新文件状态失败，文件记录不存在 => fileMd5: {}, fileName: {}", fileMd5, fileName);
+                        return new RuntimeException("文件记录不存在: " + fileMd5);
+                    });
+            DocumentType documentType = fileUpload.getDocumentTypeEnum();
+            String chunkKey = UploadChunkKey.of(fileMd5, userId, documentType);
+
+            logger.debug("查询分片信息 => fileMd5: {}, chunkKey: {}, documentType: {}", fileMd5, chunkKey, documentType);
+            List<ChunkInfo> chunks = chunkInfoRepository.findByFileMd5OrderByChunkIndexAsc(chunkKey);
+            logger.info("查询到分片信息 => fileMd5: {}, fileName: {}, fileType: {}, documentType: {}, 分片数量: {}",
+                    fileMd5, fileName, fileType, documentType, chunks.size());
+
             int expectedChunks = getTotalChunks(fileMd5, userId);
             if (chunks.size() != expectedChunks) {
-                logger.error("分片数量不匹配 => fileMd5: {}, fileName: {}, fileType: {}, 期望: {}, 实际: {}", 
-                          fileMd5, fileName, fileType, expectedChunks, chunks.size());
+                logger.error("分片数量不匹配 => fileMd5: {}, fileName: {}, fileType: {}, 期望: {}, 实际: {}",
+                        fileMd5, fileName, fileType, expectedChunks, chunks.size());
                 throw new RuntimeException(String.format(
-                    "分片数量不匹配，期望: %d, 实际: %d", expectedChunks, chunks.size()));
+                        "分片数量不匹配，期望: %d, 实际: %d", expectedChunks, chunks.size()));
             }
-            
+
             List<String> partPaths = chunks.stream()
                     .map(ChunkInfo::getStoragePath)
                     .collect(Collectors.toList());
-            logger.debug("分片路径列表 => fileMd5: {}, fileName: {}, 路径数量: {}", fileMd5, fileName, partPaths.size());
+            logger.debug("分片路径列表 => fileMd5: {}, fileName: {}, 路径数量: {}",
+                    fileMd5, fileName, partPaths.size());
 
-            // 检查每个分片是否存在
-            logger.info("开始检查每个分片是否存在 => fileMd5: {}, fileName: {}, fileType: {}", fileMd5, fileName, fileType);
+            logger.info("开始检查每个分片是否存在 => fileMd5: {}, fileName: {}, fileType: {}, bucket: {}",
+                    fileMd5, fileName, fileType, fileUpload.getStorageBucket());
             for (int i = 0; i < partPaths.size(); i++) {
                 String path = partPaths.get(i);
                 try {
-                    StatObjectResponse stat = minioClient.statObject(
-                        StatObjectArgs.builder()
-                            .bucket("uploads")
-                            .object(path)
-                            .build()
-                    );
-                    logger.debug("分片存在 => fileName: {}, index: {}, path: {}, size: {}", fileName, i, path, stat.size());
+                    StatObjectResponse stat = documentStorageService.stat(fileUpload, path);
+                    logger.debug("分片存在 => fileName: {}, index: {}, path: {}, size: {}",
+                            fileName, i, path, stat.size());
                 } catch (Exception e) {
-                    logger.error("分片不存在或无法访问 => fileName: {}, index: {}, path: {}, 错误: {}", 
-                              fileName, i, path, e.getMessage(), e);
+                    logger.error("分片不存在或无法访问 => fileName: {}, index: {}, path: {}, 错误: {}",
+                            fileName, i, path, e.getMessage(), e);
                     throw new RuntimeException("分片 " + i + " 不存在或无法访问: " + e.getMessage(), e);
                 }
             }
-            logger.info("分片检查完成，所有分片都存在 => fileMd5: {}, fileName: {}, fileType: {}", fileMd5, fileName, fileType);
-            
-            // 使用 MD5 作为 MinIO 对象路径，确保同名不同内容的文件不会互相覆盖
-            String mergedPath = "merged/" + fileMd5;
-            logger.info("开始合并分片 => fileMd5: {}, fileName: {}, fileType: {}, 合并后路径: {}", fileMd5, fileName, fileType, mergedPath);
-            
-            try {
-                // 合并分片
-                List<ComposeSource> sources = partPaths.stream()
-                        .map(path -> ComposeSource.builder().bucket("uploads").object(path).build())
-                        .collect(Collectors.toList());
-                
-                logger.debug("构建合并请求 => fileMd5: {}, fileName: {}, targetPath: {}, sourcePaths: {}", 
-                          fileMd5, fileName, mergedPath, partPaths);
-                
-                minioClient.composeObject(
-                        ComposeObjectArgs.builder()
-                                .bucket("uploads")
-                                .object(mergedPath)
-                                .sources(sources)
-                                .build()
-                );
-                logger.info("分片合并成功 => fileMd5: {}, fileName: {}, fileType: {}, mergedPath: {}", fileMd5, fileName, fileType, mergedPath);
-                
-                // 检查合并后的文件
-                StatObjectResponse stat = minioClient.statObject(
-                    StatObjectArgs.builder()
-                        .bucket("uploads")
-                        .object(mergedPath)
-                        .build()
-                );
-                logger.info("合并文件信息 => fileMd5: {}, fileName: {}, fileType: {}, path: {}, size: {}", fileMd5, fileName, fileType, mergedPath, stat.size());
+            logger.info("分片检查完成，所有分片都存在 => fileMd5: {}, fileName: {}, fileType: {}",
+                    fileMd5, fileName, fileType);
 
-                // 清理分片文件
-                logger.info("开始清理分片文件 => fileMd5: {}, fileName: {}, 分片数量: {}", fileMd5, fileName, partPaths.size());
+            String mergedPath = documentStorageService.resolve(fileUpload).mergedObjectKey();
+            logger.info("开始合并分片 => fileMd5: {}, fileName: {}, fileType: {}, documentType: {}, 合并后路径: {}",
+                    fileMd5, fileName, fileType, documentType, mergedPath);
+
+            try {
+                documentStorageService.composeMerged(fileUpload, partPaths);
+                logger.info("分片合并成功 => fileMd5: {}, fileName: {}, fileType: {}, mergedPath: {}",
+                        fileMd5, fileName, fileType, mergedPath);
+
+                StatObjectResponse stat = documentStorageService.statMerged(fileUpload);
+                logger.info("合并文件信息 => fileMd5: {}, fileName: {}, fileType: {}, path: {}, size: {}",
+                        fileMd5, fileName, fileType, mergedPath, stat.size());
+
+                logger.info("开始清理分片文件 => fileMd5: {}, fileName: {}, 分片数量: {}",
+                        fileMd5, fileName, partPaths.size());
                 for (String path : partPaths) {
                     try {
-                        minioClient.removeObject(
-                                RemoveObjectArgs.builder()
-                                        .bucket("uploads")
-                                        .object(path)
-                                        .build()
-                        );
+                        documentStorageService.deleteObject(fileUpload, path);
                         logger.debug("分片文件已删除 => fileName: {}, path: {}", fileName, path);
                     } catch (Exception e) {
-                        // 记录错误但不中断流程
-                        logger.warn("删除分片文件失败，将继续处理 => fileName: {}, path: {}, 错误: {}", fileName, path, e.getMessage());
+                        logger.warn("删除分片文件失败，将继续处理 => fileName: {}, path: {}, 错误: {}",
+                                fileName, path, e.getMessage());
                     }
                 }
-                logger.info("分片文件清理完成 => fileMd5: {}, fileName: {}, fileType: {}", fileMd5, fileName, fileType);
 
-                // 删除 Redis 中的分片状态记录
                 logger.info("删除Redis中的分片状态记录 => fileMd5: {}, fileName: {}, userId: {}", fileMd5, fileName, userId);
-                deleteFileMark(fileMd5, userId);
-                logger.info("分片状态记录已删除 => fileMd5: {}, fileName: {}, userId: {}", fileMd5, fileName, userId);
+                deleteFileMark(fileMd5, userId, documentType);
 
-                // 更新文件状态
-                logger.info("更新文件状态为已完成 => fileMd5: {}, fileName: {}, fileType: {}, userId: {}", fileMd5, fileName, fileType, userId);
-                FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
-                        .orElseThrow(() -> {
-                            logger.error("更新文件状态失败，文件记录不存在 => fileMd5: {}, fileName: {}", fileMd5, fileName);
-                            return new RuntimeException("文件记录不存在: " + fileMd5);
-                        });
                 fileUpload.setStatus(FileUpload.STATUS_COMPLETED);
                 fileUpload.setMergedAt(LocalDateTime.now());
+                fileUpload.setStorageBucket(documentStorageService.resolve(fileUpload).bucket());
+                fileUpload.setStorageObjectKey(mergedPath);
                 fileUploadRepository.save(fileUpload);
                 logger.info("文件状态已更新为已完成 => fileMd5: {}, fileName: {}, fileType: {}", fileMd5, fileName, fileType);
 
-                // 生成预签名 URL（有效期为 1 小时）
                 logger.info("开始生成预签名URL => fileMd5: {}, fileName: {}, path: {}", fileMd5, fileName, mergedPath);
-                String presignedUrl = generateMergedObjectUrl(fileMd5);
-                logger.info("预签名URL已生成 => fileMd5: {}, fileName: {}, fileType: {}, URL: {}", fileMd5, fileName, fileType, presignedUrl);
-                
+                String presignedUrl = documentStorageService.presignMerged(fileUpload);
+                logger.info("预签名URL已生成 => fileMd5: {}, fileName: {}, fileType: {}",
+                        fileMd5, fileName, fileType);
+
                 return presignedUrl;
             } catch (Exception e) {
-                logger.error("合并文件失败 => fileMd5: {}, fileName: {}, fileType: {}, 错误类型: {}, 错误信息: {}", 
-                          fileMd5, fileName, fileType, e.getClass().getName(), e.getMessage(), e);
+                logger.error("合并文件失败 => fileMd5: {}, fileName: {}, fileType: {}, 错误类型: {}, 错误信息: {}",
+                        fileMd5, fileName, fileType, e.getClass().getName(), e.getMessage(), e);
                 throw new RuntimeException("合并文件失败: " + e.getMessage(), e);
             }
         } catch (Exception e) {
-            logger.error("文件合并过程中发生错误 => fileMd5: {}, fileName: {}, fileType: {}, 错误类型: {}, 错误信息: {}", 
-                      fileMd5, fileName, fileType, e.getClass().getName(), e.getMessage(), e);
+            logger.error("文件合并过程中发生错误 => fileMd5: {}, fileName: {}, fileType: {}, 错误类型: {}, 错误信息: {}",
+                    fileMd5, fileName, fileType, e.getClass().getName(), e.getMessage(), e);
             throw new RuntimeException("文件合并失败: " + e.getMessage(), e);
         }
     }
 
     public GetObjectResponse getMergedFileStream(String fileMd5) throws Exception {
-        return minioClient.getObject(
-                GetObjectArgs.builder()
-                        .bucket("uploads")
-                        .object("merged/" + fileMd5)
-                        .build()
-        );
+        return fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                .map(fileUpload -> {
+                    try {
+                        return getMergedFileStream(fileUpload);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .orElseGet(() -> {
+                    try {
+                        DocumentStorageService.StorageLocation legacy = documentStorageService.resolveLegacyPublic(fileMd5);
+                        return minioClient.getObject(GetObjectArgs.builder()
+                                .bucket(legacy.bucket())
+                                .object(legacy.mergedObjectKey())
+                                .build());
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+    }
+
+    public GetObjectResponse getMergedFileStream(FileUpload fileUpload) throws Exception {
+        try {
+            return documentStorageService.getMerged(fileUpload);
+        } catch (Exception storedFailure) {
+            // 兼容历史数据：旧记录没有 storage_bucket/storage_object_key，对象仍在公开 bucket 的 merged/{md5}
+            if (!hasStoredLocation(fileUpload)) {
+                DocumentStorageService.StorageLocation legacy = documentStorageService.resolveLegacyPublic(fileUpload.getFileMd5());
+                return minioClient.getObject(GetObjectArgs.builder()
+                        .bucket(legacy.bucket())
+                        .object(legacy.mergedObjectKey())
+                        .build());
+            }
+            throw storedFailure;
+        }
     }
 
     public String generateMergedObjectUrl(String fileMd5) throws Exception {
-        return minioClient.getPresignedObjectUrl(
-                GetPresignedObjectUrlArgs.builder()
+        return fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                .map(fileUpload -> {
+                    try {
+                        return generateMergedObjectUrl(fileUpload);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .orElseGet(() -> {
+                    try {
+                        DocumentStorageService.StorageLocation legacy = documentStorageService.resolveLegacyPublic(fileMd5);
+                        return minioClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
+                                .method(Method.GET)
+                                .bucket(legacy.bucket())
+                                .object(legacy.mergedObjectKey())
+                                .expiry(1, TimeUnit.HOURS)
+                                .build());
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+    }
+
+    public String generateMergedObjectUrl(FileUpload fileUpload) throws Exception {
+        try {
+            return documentStorageService.presignMerged(fileUpload);
+        } catch (Exception storedFailure) {
+            if (!hasStoredLocation(fileUpload)) {
+                DocumentStorageService.StorageLocation legacy = documentStorageService.resolveLegacyPublic(fileUpload.getFileMd5());
+                return minioClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
                         .method(Method.GET)
-                        .bucket("uploads")
-                        .object("merged/" + fileMd5)
+                        .bucket(legacy.bucket())
+                        .object(legacy.mergedObjectKey())
                         .expiry(1, TimeUnit.HOURS)
-                        .build()
-        );
+                        .build());
+            }
+            throw storedFailure;
+        }
+    }
+
+    public void deleteMergedFile(FileUpload fileUpload) throws Exception {
+        try {
+            documentStorageService.deleteMerged(fileUpload);
+        } catch (Exception storedFailure) {
+            if (!hasStoredLocation(fileUpload)) {
+                DocumentStorageService.StorageLocation legacy = documentStorageService.resolveLegacyPublic(fileUpload.getFileMd5());
+                minioClient.removeObject(RemoveObjectArgs.builder()
+                        .bucket(legacy.bucket())
+                        .object(legacy.mergedObjectKey())
+                        .build());
+                return;
+            }
+            throw storedFailure;
+        }
+    }
+
+    /**
+     * 删除上传分片元数据，分片键按文档类型/用户隔离。
+     */
+    public void deleteUploadChunkInfo(String fileMd5, String userId) {
+        DocumentType documentType = resolveDocumentType(fileMd5, userId);
+        chunkInfoRepository.deleteByFileMd5(UploadChunkKey.of(fileMd5, userId, documentType));
+    }
+
+    private boolean hasStoredLocation(FileUpload fileUpload) {
+        return fileUpload.getStorageBucket() != null && !fileUpload.getStorageBucket().isBlank()
+                && fileUpload.getStorageObjectKey() != null && !fileUpload.getStorageObjectKey().isBlank();
     }
 
     /**
@@ -673,15 +786,21 @@ public class UploadService {
                                              String fileName,
                                              String orgTag,
                                              boolean isPublic,
+                                             DocumentType documentType,
                                              String userId,
                                              String fileType) {
+        DocumentType resolvedType = documentType == null ? DocumentType.STRUCTURED_LAW : documentType;
         Optional<FileUpload> existingFileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId);
         if (existingFileUpload.isPresent()) {
-            return existingFileUpload.get();
+            FileUpload existing = existingFileUpload.get();
+            if (existing.getDocumentTypeEnum() != resolvedType) {
+                throw new CustomException("该文件已按其他文档类型上传，请先删除原文档后重新上传", HttpStatus.CONFLICT);
+            }
+            return existing;
         }
 
-        logger.info("创建新的文件记录 => fileMd5: {}, fileName: {}, fileType: {}, totalSize: {}, userId: {}, orgTag: {}, isPublic: {}",
-                fileMd5, fileName, fileType, totalSize, userId, orgTag, isPublic);
+        logger.info("创建新的文件记录 => fileMd5: {}, fileName: {}, fileType: {}, totalSize: {}, userId: {}, orgTag: {}, isPublic: {}, documentType: {}",
+                fileMd5, fileName, fileType, totalSize, userId, orgTag, isPublic, resolvedType);
 
         FileUpload fileUpload = new FileUpload();
         fileUpload.setFileMd5(fileMd5);
@@ -690,9 +809,16 @@ public class UploadService {
         fileUpload.setStatus(FileUpload.STATUS_UPLOADING);
         fileUpload.setUserId(userId);
         fileUpload.setOrgTag(orgTag);
-        fileUpload.setPublic(isPublic);
+        fileUpload.setDocumentTypeEnum(resolvedType);
+        // 私人案件文档强制私有，禁止任何公开路径
+        fileUpload.setPublic(!resolvedType.isPrivateDocument() && isPublic);
         fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_PENDING);
         fileUpload.setVectorizationErrorMessage(null);
+
+        DocumentStorageService.StorageLocation location = documentStorageService.resolve(
+                resolvedType, userId, fileMd5);
+        fileUpload.setStorageBucket(location.bucket());
+        fileUpload.setStorageObjectKey(location.mergedObjectKey());
 
         try {
             return fileUploadRepository.save(fileUpload);

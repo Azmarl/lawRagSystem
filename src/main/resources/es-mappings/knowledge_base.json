@@ -1,7 +1,7 @@
 {
   "mappings": {
     "_meta": {
-      "version": 1
+      "version": 3
     },
     "properties": {
       "fileMd5": {
@@ -75,6 +75,21 @@
         "type": "float"
       },
       "documentType": {
+        "type": "keyword"
+      },
+      "chunkStrategy": {
+        "type": "keyword"
+      },
+      "caseSection": {
+        "type": "keyword"
+      },
+      "blockId": {
+        "type": "keyword"
+      },
+      "chunkRole": {
+        "type": "keyword"
+      },
+      "contentType": {
         "type": "keyword"
       },
       "parentBlockId": {

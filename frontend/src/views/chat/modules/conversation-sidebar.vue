@@ -54,20 +54,41 @@ function formatDate(dateStr?: string) {
 <template>
   <div
     class="relative flex h-full flex-col border-r border-[rgb(var(--border-color)/0.3)] bg-white transition-all duration-300 dark:bg-[#1a1a1a]"
-    :class="collapsed ? 'w-[40px] min-w-[40px] overflow-hidden' : 'w-[300px] min-w-[300px]'"
+    :class="collapsed ? 'w-64px min-w-64px overflow-hidden' : 'w-[300px] min-w-[300px]'"
   >
-    <!-- Header / Collapsed bar -->
-    <div v-if="collapsed" class="flex flex-col items-center gap-3 pt-3">
-      <NButton type="primary" size="tiny" circle @click="handleNewChat">
-        <template #icon>
-          <icon-material-symbols:add-rounded class="text-16px" />
-        </template>
-      </NButton>
-      <NButton text size="tiny" @click="collapsed = false">
-        <template #icon>
-          <icon-material-symbols:chevron-right-rounded class="text-16px" />
-        </template>
-      </NButton>
+    <!-- Collapsed rail：参照 global-sidebar 收起态设计 -->
+    <div v-if="collapsed" class="flex min-h-0 w-full flex-1 flex-col items-center">
+      <div class="flex flex-col items-center gap-1 pb-8px pt-8px">
+        <MenuToggler arrow-icon :collapsed="true" @click="collapsed = false" />
+        <button
+          type="button"
+          class="h-48px w-48px flex-col-center cursor-pointer rounded-8px transition-300 hover:bg-[rgb(var(--primary-color)/0.08)]"
+          title="新对话"
+          @click="handleNewChat"
+        >
+          <icon-material-symbols:add-rounded class="text-icon-large text-[rgb(var(--primary-color))]" />
+        </button>
+      </div>
+
+      <!-- 会话图标导航：收起后仍可切换对话 -->
+      <div class="flex min-h-0 w-full flex-1 flex-col overflow-hidden pb-8px">
+        <NScrollbar class="w-full">
+          <div class="flex flex-col items-center">
+            <div
+              v-for="session in filteredSessions"
+              :key="session.conversationId"
+              class="mb-6px flex h-40px w-40px flex-col-center cursor-pointer rounded-8px transition-300"
+              :class="session.conversationId === conversationId
+                ? 'bg-[rgb(var(--primary-color)/0.1)] text-[rgb(var(--primary-color))]'
+                : 'text-#999 hover:bg-[rgb(0,0,0,0.08)] dark:text-#777 dark:hover:bg-[#FFFFFF0A]'"
+              :title="session.title"
+              @click="handleSelect(session.conversationId)"
+            >
+              <icon-material-symbols:chat-outline-rounded class="text-22px" />
+            </div>
+          </div>
+        </NScrollbar>
+      </div>
     </div>
 
     <div v-else class="flex items-center justify-between px-4 pt-4 pb-2">
@@ -93,7 +114,7 @@ function formatDate(dateStr?: string) {
     </div>
 
     <!-- Tabs -->
-    <div class="mx-4 mb-2 flex rounded-lg bg-[rgb(var(--border-color)/0.15)] p-0.5 dark:bg-[#FFFFFF0A]">
+    <div v-if="!collapsed" class="mx-4 mb-2 flex rounded-lg bg-[rgb(var(--border-color)/0.15)] p-0.5 dark:bg-[#FFFFFF0A]">
       <div
         class="flex-1 cursor-pointer rounded-md px-3 py-1.5 text-center text-12px font-500 transition-all"
         :class="activeTab === 'active'
@@ -115,7 +136,7 @@ function formatDate(dateStr?: string) {
     </div>
 
     <!-- List -->
-    <div class="flex min-h-0 flex-1 overflow-hidden">
+    <div v-if="!collapsed" class="flex min-h-0 flex-1 overflow-hidden">
       <NScrollbar class="flex-1 px-2">
         <NSpin :show="sessionsLoading" class="h-full">
           <TransitionGroup name="session-list" tag="div">

@@ -24,6 +24,12 @@ public class TextChunk {
     private Double legalTermDensity; // 法律术语密度
     private String parentBlockId;
     private Integer chunkPosition;
+    private String documentType;
+    private String chunkStrategy;
+    private String caseSection;
+    private String blockId;
+    private String chunkRole;
+    private String contentType;
 
     // 构造方法
     public TextChunk(int chunkId, String content) {

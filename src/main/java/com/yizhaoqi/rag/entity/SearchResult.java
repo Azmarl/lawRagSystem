@@ -38,6 +38,37 @@ public class SearchResult {
     /** 命中原因描述 */
     private String hitReason;
 
+    // ===== 私人案件检索与意图识别字段 =====
+
+    /** 文档类型：STRUCTURED_LAW / PRIVATE_LEGAL */
+    private String documentType;
+    /** 分块策略 */
+    private String chunkStrategy;
+    /** 私人案件段落类型 */
+    private String caseSection;
+    /** 子块 ID */
+    private String blockId;
+    /** 父块 ID：命中子块后用于回补父段上下文 */
+    private String parentBlockId;
+    /** 父块上下文（命中子块时回填，供 LLM 使用） */
+    private String contextText;
+    /** 内容类型：TEXT / TABLE / FIGURE */
+    private String contentType;
+    /** 本次检索范围：PUBLIC / PRIVATE / BOTH */
+    private String searchScope;
+    /** 意图分类：PUBLIC / PRIVATE / BOTH */
+    private String intentCategory;
+    /** 意图识别置信度 */
+    private Double intentConfidence;
+    /** 意图识别说明 */
+    private String intentReason;
+    /** 当前结果来自哪个语料：PUBLIC_CODE / PRIVATE_CASE */
+    private String sourceCorpus;
+
+    public boolean isPrivateDocument() {
+        return "PRIVATE_LEGAL".equalsIgnoreCase(documentType);
+    }
+
     public SearchResult(String fileMd5, Integer chunkId, String textContent, Double score) {
         this(fileMd5, chunkId, textContent, score, null, null, false, null, null, null, null, null);
     }

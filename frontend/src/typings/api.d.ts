@@ -360,6 +360,9 @@ declare namespace Api {
       orgTagName?: string | null;
       public: boolean;
       isPublic: boolean;
+      documentType?: 'STRUCTURED_LAW' | 'PRIVATE_LEGAL';
+      documentTypeLabel?: string;
+      privateDocument?: boolean;
       uploadedChunks: number[];
       progress: number;
       status: UploadStatus;
@@ -383,6 +386,20 @@ declare namespace Api {
       totalChunks: number;
     }
 
+    interface UploadDocumentTypeOption {
+      value: 'STRUCTURED_LAW' | 'PRIVATE_LEGAL';
+      label: string;
+      allowPublic: boolean;
+      defaultOrgTag: string;
+    }
+
+    interface UploadConfig {
+      orgTags: string[];
+      primaryOrg: string;
+      privateOrgTag: string;
+      documentTypes: UploadDocumentTypeOption[];
+    }
+
     interface MergeResult {
       objectUrl: string;
       estimatedEmbeddingTokens?: number;
@@ -398,13 +415,25 @@ declare namespace Api {
       fileName: string;
       pageNumber?: number | null;
       anchorText?: string | null;
-      retrievalMode?: 'HYBRID' | 'TEXT_ONLY' | null;
+      retrievalMode?: 'HYBRID' | 'HYBRID_ADAPTIVE' | 'TEXT_ONLY' | null;
       retrievalLabel?: string | null;
       retrievalQuery?: string | null;
       matchedChunkText?: string | null;
       evidenceSnippet?: string | null;
       score?: number | null;
       chunkId?: number | null;
+      documentType?: string | null;
+      chunkStrategy?: string | null;
+      caseSection?: string | null;
+      blockId?: string | null;
+      parentBlockId?: string | null;
+      contextText?: string | null;
+      contentType?: string | null;
+      searchScope?: string | null;
+      intentCategory?: string | null;
+      intentConfidence?: number | null;
+      intentReason?: string | null;
+      sourceCorpus?: string | null;
     }
 
     interface Input {
@@ -451,6 +480,18 @@ declare namespace Api {
       chapterName?: string | null;
       sectionName?: string | null;
       articleId?: string | null;
+      documentType?: string | null;
+      chunkStrategy?: string | null;
+      caseSection?: string | null;
+      blockId?: string | null;
+      parentBlockId?: string | null;
+      contextText?: string | null;
+      contentType?: string | null;
+      searchScope?: string | null;
+      intentCategory?: string | null;
+      intentConfidence?: number | null;
+      intentReason?: string | null;
+      sourceCorpus?: string | null;
     }
 
     interface Token {

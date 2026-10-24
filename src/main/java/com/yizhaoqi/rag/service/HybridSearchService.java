@@ -4,42 +4,45 @@ import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
-import com.yizhaoqi.rag.client.EmbeddingClient;
-import com.yizhaoqi.rag.client.AliyunDecisionClient;
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.chunker.LegalTermScorer;
+import com.yizhaoqi.rag.client.EmbeddingClient;
 import com.yizhaoqi.rag.entity.EsDocument;
 import com.yizhaoqi.rag.entity.SearchResult;
-import com.yizhaoqi.rag.model.User;
-import com.yizhaoqi.rag.model.FileUpload;
 import com.yizhaoqi.rag.exception.CustomException;
+import com.yizhaoqi.rag.model.FileUpload;
+import com.yizhaoqi.rag.model.User;
 import com.yizhaoqi.rag.repository.FileUploadRepository;
 import com.yizhaoqi.rag.repository.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
- * 混合搜索服务 —— 双路并发召回 + Adaptive α 融合。
+ * 混合搜索服务 —— 意图识别 + 双路并发召回 + Adaptive α 融合。
  *
- * 两条独立查询路径：
- * - 路径 A (BM25 倒排召回)：match textContent + term articleId（高 boost）
- * - 路径 B (KNN 向量召回)：dense_vector 语义相似度
+ * <p>检索前先由 {@link IntentRecognitionService} 判断本次应访问：</p>
+ * <ul>
+ *   <li>PUBLIC：仅公开法典索引；</li>
+ *   <li>PRIVATE：仅私人案件索引；</li>
+ *   <li>MIXED：两个索引分别召回后合并，保证混合提问同时拿到法典和案件材料。</li>
+ * </ul>
  *
- * 融合公式：
- *   FinalScore = α * BM25_NormScore + (1-α) * KNN_NormScore
- *   α = sigmoid(w1 * articleIdDensity(query) + w2 * legalTermDensity(query) + bias)
- *
- * 权限过滤（原封不动保留）：
- *   - 用户自己的文档
- *   - 公开文档
- *   - 用户所属组织的文档（含层级关系）
+ * <p>每个范围内仍复用原有 BM25 + KNN 双路召回、Adaptive α 融合和权限过滤。
+ * 私人案件文档只允许所有者访问，永远不会通过 public / orgTag 分支泄漏。</p>
  */
 @Service
 public class HybridSearchService {
@@ -49,14 +52,15 @@ public class HybridSearchService {
     /** BM25 和 KNN 的召回窗口扩大系数 */
     private static final int RECALL_FACTOR = 3;
 
+    private static final String PRIVATE_DOCUMENT_TYPE = DocumentType.PRIVATE_LEGAL.name();
+    private static final String PUBLIC_CORPUS = "PUBLIC_CODE";
+    private static final String PRIVATE_CORPUS = "PRIVATE_CASE";
+
     @Autowired
     private ElasticsearchClient esClient;
 
     @Autowired
     private EmbeddingClient embeddingClient;
-
-    @Autowired
-    private UserService userService;
 
     @Autowired
     private UserRepository userRepository;
@@ -68,158 +72,150 @@ public class HybridSearchService {
     private FileUploadRepository fileUploadRepository;
 
     @Autowired
-    private AliyunDecisionClient aliyunDecisionClient;
+    private IntentRecognitionService intentRecognitionService;
 
-    @Value("${aliyun.decision.routing.confidence-threshold:0.85}")
-    private double decisionConfidenceThreshold;
+    @Autowired
+    private DocumentChunkContextService documentChunkContextService;
 
     private final LegalTermScorer termScorer = new LegalTermScorer();
 
     /**
-     * 使用双路并发召回 + Adaptive α 融合进行带权限搜索。
-     *
-     * @param query  查询字符串
-     * @param userId 用户ID
-     * @param topK   返回结果数量
-     * @return 搜索结果列表（含融合得分与溯源信息）
+     * 向后兼容入口：不携带对话上下文。
      */
     public List<SearchResult> searchWithPermission(String query, String userId, int topK) {
-        logger.debug("开始带权限双路并发搜索，查询: {}, 用户ID: {}, topK: {}", query, userId, topK);
+        return searchWithPermission(query, userId, topK, null);
+    }
+
+    /**
+     * 意图识别 + 按范围双路召回。
+     *
+     * @param query               用户问题
+     * @param userId              用户ID
+     * @param topK                返回条数
+     * @param conversationContext 最近对话/检索摘要，用于指代消解
+     */
+    public List<SearchResult> searchWithPermission(String query, String userId, int topK,
+            String conversationContext) {
+        logger.debug("开始带权限检索，查询: {}, 用户ID: {}, topK: {}", query, userId, topK);
 
         try {
-            // ===== 1. 获取用户权限信息（保留原有逻辑） =====
-            List<String> userEffectiveTags = getUserEffectiveOrgTags(userId);
-            logger.debug("用户 {} 的有效组织标签: {}", userId, userEffectiveTags);
+            UserContext userContext = resolveUserContext(userId);
+            RetrievalIntent intent = intentRecognitionService.recognize(
+                    query, conversationContext, userContext.effectiveTags());
+            SearchScope scope = SearchScope.from(intent);
 
-            String userDbId = getUserDbId(userId);
-            logger.debug("用户 {} 的数据库ID: {}", userId, userDbId);
-
-            // ===== 2. 计算 Adaptive α（含精确条文查询补偿）=====
             LegalTermScorer.ArticleIdQueryInfo queryInfo = termScorer.analyzeQuery(query);
             double alpha = termScorer.computeAlpha(queryInfo);
-            SearchScope searchScope = resolveSearchScope(query, queryInfo);
-            String[] searchIndices = indicesFor(searchScope);
-            logger.info("Adaptive α 计算: query='{}', articleIdDensity={:.4f}, legalTermDensity={:.4f}, α={:.4f}",
-                    query, queryInfo.articleIdDensity(), queryInfo.legalTermDensity(), alpha);
+            logger.info("Adaptive α: query='{}', articleIdDensity={}, legalTermDensity={}, α={}, intent={}",
+                    query, queryInfo.articleIdDensity(), queryInfo.legalTermDensity(), alpha, intent.category());
 
-            // ===== 3. 生成查询向量 =====
             final List<Float> queryVector = embedToVectorList(query, userId);
-
-            // 如果向量生成失败，退化为纯 BM25
-            if (queryVector == null) {
-                logger.warn("向量生成失败，退化为纯 BM25 搜索");
-                return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, topK, searchIndices);
+            List<SearchResult> results;
+            if (scope == SearchScope.BOTH) {
+                CompletableFuture<List<SearchResult>> publicFuture = CompletableFuture.supplyAsync(
+                        () -> retrieveSafe(SearchScope.PUBLIC, query, userContext, topK, queryInfo, alpha, queryVector));
+                CompletableFuture<List<SearchResult>> privateFuture = CompletableFuture.supplyAsync(
+                        () -> retrieveSafe(SearchScope.PRIVATE, query, userContext, topK, queryInfo, alpha, queryVector));
+                results = mergeMixed(publicFuture.join(), privateFuture.join(), topK);
+            } else {
+                results = retrieveSafe(scope, query, userContext, topK, queryInfo, alpha, queryVector);
             }
 
-            // ===== 4. 双路并发查询 =====
-            int recallK = topK * RECALL_FACTOR;
-
-            // 路径 A: BM25 倒排召回（异步）
-            CompletableFuture<Map<String, HitScore>> bm25Future = CompletableFuture.supplyAsync(() -> {
-                try {
-                    return executeBm25Query(query, userDbId, userEffectiveTags, recallK, queryInfo, searchIndices);
-                } catch (Exception e) {
-                    logger.error("BM25 查询失败", e);
-                    return Collections.emptyMap();
-                }
-            });
-
-            // 路径 B: KNN 向量召回（异步）
-            CompletableFuture<Map<String, HitScore>> knnFuture = CompletableFuture.supplyAsync(() -> {
-                try {
-                    return executeKnnQuery(queryVector, userDbId, userEffectiveTags, recallK, searchIndices);
-                } catch (Exception e) {
-                    logger.error("KNN 查询失败", e);
-                    return Collections.emptyMap();
-                }
-            });
-
-            // 等待双路完成
-            Map<String, HitScore> bm25Results = bm25Future.join();
-            Map<String, HitScore> knnResults = knnFuture.join();
-
-            logger.info("双路召回完成: BM25={} 条, KNN={} 条", bm25Results.size(), knnResults.size());
-
-            // ===== 5. 归一化与融合打分 =====
-            List<SearchResult> fusedResults = fuseAndRank(
-                    bm25Results, knnResults, alpha, topK, query, queryInfo);
-
-            logger.debug("融合排序完成，返回 {} 条结果，α={:.4f}", fusedResults.size(), alpha);
-            attachFileNames(fusedResults);
-            return fusedResults;
-
+            attachIntentMetadata(results, intent, scope);
+            attachFileNames(results);
+            logger.info("检索完成: query='{}', intent={}, scope={}, resultCount={}, privateCount={}",
+                    query, intent.category(), scope, results.size(),
+                    results.stream().filter(SearchResult::isPrivateDocument).count());
+            return results;
         } catch (Exception e) {
-            logger.error("带权限的双路搜索失败", e);
-            try {
-                logger.info("尝试使用纯文本搜索作为后备方案");
-                LegalTermScorer.ArticleIdQueryInfo fallbackInfo = termScorer.analyzeQuery(query);
-                return textOnlySearchWithPermission(query, getUserDbId(userId),
-                    getUserEffectiveOrgTags(userId), topK,
-                    indicesFor(resolveSearchScope(query, fallbackInfo)));
-            } catch (Exception fallbackError) {
-                logger.error("后备搜索也失败", fallbackError);
-                return Collections.emptyList();
-            }
+            logger.error("带权限检索失败，query: {}, userId: {}", query, userId, e);
+            return Collections.emptyList();
         }
+    }
+
+    private List<SearchResult> retrieveSafe(SearchScope scope, String query, UserContext userContext,
+            int topK, LegalTermScorer.ArticleIdQueryInfo queryInfo, double alpha, List<Float> queryVector) {
+        try {
+            return retrieve(scope, query, userContext, topK, queryInfo, alpha, queryVector);
+        } catch (Exception e) {
+            logger.error("{} 范围召回失败，query: {}", scope, query, e);
+            return Collections.emptyList();
+        }
+    }
+
+    private List<SearchResult> retrieve(SearchScope scope, String query, UserContext userContext,
+            int topK, LegalTermScorer.ArticleIdQueryInfo queryInfo, double alpha, List<Float> queryVector) {
+        if (queryVector == null) {
+            logger.warn("向量生成失败，{} 范围退化为纯 BM25 搜索", scope);
+            return textOnlySearchWithPermission(query, userContext, topK, scope);
+        }
+
+        int recallK = Math.max(topK, topK * RECALL_FACTOR);
+        String index = scope.index();
+
+        CompletableFuture<Map<String, HitScore>> bm25Future = CompletableFuture.supplyAsync(() -> {
+            try {
+                return executeBm25Query(query, userContext, recallK, queryInfo, index, scope);
+            } catch (Exception e) {
+                logger.error("BM25 查询失败，scope: {}", scope, e);
+                return Collections.emptyMap();
+            }
+        });
+        CompletableFuture<Map<String, HitScore>> knnFuture = CompletableFuture.supplyAsync(() -> {
+            try {
+                return executeKnnQuery(queryVector, userContext, recallK, index, scope);
+            } catch (Exception e) {
+                logger.error("KNN 查询失败，scope: {}", scope, e);
+                return Collections.emptyMap();
+            }
+        });
+
+        Map<String, HitScore> bm25Results = bm25Future.join();
+        Map<String, HitScore> knnResults = knnFuture.join();
+        logger.info("双路召回完成，scope: {}, BM25={} 条, KNN={} 条",
+                scope, bm25Results.size(), knnResults.size());
+
+        List<SearchResult> results = fuseAndRank(bm25Results, knnResults, alpha, topK, queryInfo, scope);
+        expandParentContexts(results, scope, userContext);
+        return results;
     }
 
     // ========================
     // 路径 A：BM25 倒排召回
     // ========================
 
-    private Map<String, HitScore> executeBm25Query(String query, String userDbId,
-            List<String> userEffectiveTags, int recallK,
-            LegalTermScorer.ArticleIdQueryInfo queryInfo, String[] indices) throws Exception {
-
-        // 展开 articleId：阿拉伯数字形式 → 同时包含中文数字形式（双向转换）
+    private Map<String, HitScore> executeBm25Query(String query, UserContext userContext, int recallK,
+            LegalTermScorer.ArticleIdQueryInfo queryInfo, String index, SearchScope scope) throws Exception {
         List<String> expandedArticleIds = termScorer.expandArticleIds(queryInfo.matchedArticleIds());
-        boolean hasArticleIds = !expandedArticleIds.isEmpty();
+        // 私人案件文档不一定出现精确条文号；混合/私人范围使用宽匹配，确保案件内容能被召回
+        boolean hasArticleIds = !expandedArticleIds.isEmpty() && scope == SearchScope.PUBLIC;
 
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index(Arrays.asList(indices));
+            s.index(index);
             s.size(recallK);
-
             s.query(q -> q.bool(b -> {
                 if (hasArticleIds) {
-                    // 精确条文查询模式：must 至少命中一个 articleId（match_phrase 或 term），
-                    // 再加法典名作为辅助 boost
                     b.must(m -> m.bool(inner -> {
                         for (String articleId : expandedArticleIds) {
-                            // match_phrase: textContent 中精确匹配 "第一百二十三条" 或 "第123条"
-                            inner.should(sh2 -> sh2.matchPhrase(mp -> mp
-                                    .field("textContent")
-                                    .query(articleId)
-                                    .boost(5.0f)
-                            ));
-                            // term: articleId keyword 字段精确匹配
-                            inner.should(sh3 -> sh3.term(t -> t
-                                    .field("articleId")
-                                    .value(articleId)
-                                    .boost(10.0f)
-                            ));
+                            inner.should(sh -> sh.matchPhrase(mp -> mp
+                                    .field("textContent").query(articleId).boost(5.0f)));
+                            inner.should(sh -> sh.term(t -> t
+                                    .field("articleId").value(articleId).boost(10.0f)));
                         }
                         inner.minimumShouldMatch("1");
                         return inner;
                     }));
-                    // 法典名作为辅助 should（低 boost，仅在同名法典中自然偏序）
                     String lawName = extractLawName(query);
                     if (!lawName.isEmpty()) {
                         b.should(sh -> sh.matchPhrase(mp -> mp
-                                .field("textContent")
-                                .query(lawName)
-                                .boost(0.5f)
-                        ));
+                                .field("textContent").query(lawName).boost(0.5f)));
                     }
                 } else {
-                    // 非条文查询：保持原有 broad match 行为
-                    b.must(m -> m.match(ma -> ma
-                            .field("textContent")
-                            .query(query)
-                    ));
+                    b.must(m -> m.match(ma -> ma.field("textContent").query(query)));
                 }
-                // 权限过滤
                 b.filter(f -> f.bool(bf -> {
-                    buildPermissionFilterInPlace(bf, userDbId, userEffectiveTags);
+                    buildPermissionFilterInPlace(bf, userContext);
+                    applyScopeFilter(bf, scope);
                     return bf;
                 }));
                 return b;
@@ -232,18 +228,14 @@ public class HybridSearchService {
 
     /**
      * 从查询中提取法典名称。
-     * 例如："民法典第123条的内容是什么？" → "民法典"
      */
     private String extractLawName(String query) {
-        // 按条文号之前的内容截取
-        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
                 "^(.+?)(第[0-9零一二三四五六七八九十百千]+条)");
-        java.util.regex.Matcher m = p.matcher(query);
-        if (m.find()) {
-            String prefix = m.group(1);
-            // 去掉常见的口语化前缀
+        java.util.regex.Matcher matcher = pattern.matcher(query);
+        if (matcher.find()) {
+            String prefix = matcher.group(1);
             if (prefix.length() > 10) {
-                // 如果前缀太长，尝试只保留最后几个字（通常是法典名）
                 return prefix.substring(Math.max(0, prefix.length() - 6)).trim();
             }
             return prefix.trim();
@@ -255,21 +247,20 @@ public class HybridSearchService {
     // 路径 B：KNN 向量召回
     // ========================
 
-    private Map<String, HitScore> executeKnnQuery(List<Float> queryVector, String userDbId,
-            List<String> userEffectiveTags, int recallK, String[] indices) throws Exception {
-
+    private Map<String, HitScore> executeKnnQuery(List<Float> queryVector, UserContext userContext,
+            int recallK, String index, SearchScope scope) throws Exception {
         int numCandidates = recallK * 2;
 
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index(Arrays.asList(indices));
+            s.index(index);
             s.knn(kn -> kn
                     .field("vector")
                     .queryVector(queryVector)
                     .k(recallK)
                     .numCandidates(numCandidates)
-                    // KNN 内部的权限过滤
                     .filter(f -> f.bool(b -> {
-                        buildPermissionFilterInPlace(b, userDbId, userEffectiveTags);
+                        buildPermissionFilterInPlace(b, userContext);
+                        applyScopeFilter(b, scope);
                         return b;
                     }))
             );
@@ -281,50 +272,63 @@ public class HybridSearchService {
     }
 
     // ========================
-    // 权限过滤构建（保留原有逻辑）
+    // 权限过滤
     // ========================
 
-    /**
-     * 构建权限 filter bool query（与原有逻辑完全一致）。
-     */
-    private BoolQuery buildPermissionFilter(
-            co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery.Builder bf,
-            String userDbId, List<String> userEffectiveTags) {
-        buildPermissionFilterInPlace(bf, userDbId, userEffectiveTags);
-        return bf.build();
+    private void buildPermissionFilterInPlace(BoolQuery.Builder bf, UserContext userContext) {
+        // 条件1: 用户自己的文档（包含私人案件文档）
+        bf.should(s1 -> s1.term(t -> t.field("userId").value(userContext.userDbId())));
+
+        // 条件2: 公开文档，但私人案件文档即使 isPublic=true 也不过
+        bf.should(s2 -> s2.bool(inner -> {
+            inner.must(m -> m.term(t -> t.field("isPublic").value(true)));
+            inner.mustNot(mn -> mn.term(t -> t.field("documentType").value(PRIVATE_DOCUMENT_TYPE)));
+            return inner;
+        }));
+
+        // 条件3: 组织标签匹配，但私人案件文档不能走组织分支
+        bf.should(s3 -> {
+            List<String> tags = userContext.effectiveTags() == null
+                    ? List.of() : userContext.effectiveTags();
+            if (tags.isEmpty()) {
+                return s3.matchNone(mn -> mn);
+            }
+            return s3.bool(inner -> {
+                for (String tag : tags) {
+                    inner.should(sh -> sh.term(t -> t.field("orgTag").value(tag)));
+                }
+                inner.minimumShouldMatch("1");
+                inner.mustNot(mn -> mn.term(t -> t.field("documentType").value(PRIVATE_DOCUMENT_TYPE)));
+                return inner;
+            });
+        });
+
+        bf.minimumShouldMatch("1");
     }
 
-    private void buildPermissionFilterInPlace(
-            co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery.Builder bf,
-            String userDbId, List<String> userEffectiveTags) {
-        // 条件1: 用户可访问自己的文档
-        bf.should(s1 -> s1.term(t -> t.field("userId").value(userDbId)));
-        // 条件2: 公开文档
-        bf.should(s2 -> s2.term(t -> t.field("isPublic").value(true)));
-        // 条件3: 组织标签
-        bf.should(s3 -> {
-            if (userEffectiveTags.isEmpty()) {
-                return s3.matchNone(mn -> mn);
-            } else if (userEffectiveTags.size() == 1) {
-                return s3.term(t -> t.field("orgTag").value(userEffectiveTags.get(0)));
-            } else {
-                return s3.bool(inner -> {
-                    for (String tag : userEffectiveTags) {
-                        inner.should(sh2 -> sh2.term(t -> t.field("orgTag").value(tag)));
-                    }
-                    return inner;
-                });
-            }
-        });
+    /**
+     * 索引级别的双保险：公开范围排除私人类型，私人范围只允许私人类型/早期 private 分块。
+     */
+    private void applyScopeFilter(BoolQuery.Builder bf, SearchScope scope) {
+        // 父块只用于回补上下文，不参与召回；缺省 chunkRole 的历史数据不受影响
+        bf.mustNot(mn -> mn.term(t -> t.field("chunkRole").value("PARENT")));
+        if (scope == SearchScope.PUBLIC) {
+            bf.mustNot(mn -> mn.term(t -> t.field("documentType").value(PRIVATE_DOCUMENT_TYPE)));
+            bf.mustNot(mn -> mn.term(t -> t.field("chunkLevel").value("private")));
+        } else if (scope == SearchScope.PRIVATE) {
+            bf.must(m -> m.bool(inner -> {
+                inner.should(sh -> sh.term(t -> t.field("documentType").value(PRIVATE_DOCUMENT_TYPE)));
+                inner.should(sh -> sh.term(t -> t.field("chunkLevel").value("private")));
+                inner.minimumShouldMatch("1");
+                return inner;
+            }));
+        }
     }
 
     // ========================
     // 搜索结果提取
     // ========================
 
-    /**
-     * 从 ES SearchResponse 提取 docId → HitScore 映射。
-     */
     private Map<String, HitScore> extractHits(SearchResponse<EsDocument> response) {
         Map<String, HitScore> result = new LinkedHashMap<>();
         if (response.hits() == null || response.hits().hits() == null) {
@@ -335,6 +339,12 @@ public class HybridSearchService {
                 continue;
             }
             EsDocument doc = hit.source();
+            String documentType = doc.getDocumentType();
+            if (documentType == null || documentType.isBlank()) {
+                documentType = "private".equals(doc.getChunkLevel())
+                        ? DocumentType.PRIVATE_LEGAL.name()
+                        : DocumentType.STRUCTURED_LAW.name();
+            }
             result.put(hit.id(), new HitScore(
                     hit.score() != null ? hit.score() : 0.0,
                     doc.getFileMd5(),
@@ -349,7 +359,13 @@ public class HybridSearchService {
                     doc.getPartName(),
                     doc.getChapterName(),
                     doc.getSectionName(),
-                    doc.getArticleId()
+                    doc.getArticleId(),
+                    documentType,
+                    doc.getChunkStrategy(),
+                    doc.getCaseSection(),
+                    doc.getBlockId(),
+                    doc.getParentBlockId(),
+                    doc.getContentType()
             ));
         }
         return result;
@@ -359,83 +375,76 @@ public class HybridSearchService {
     // 融合打分
     // ========================
 
-    private List<SearchResult> fuseAndRank(
-            Map<String, HitScore> bm25Results,
-            Map<String, HitScore> knnResults,
-            double alpha, int topK,
-            String originalQuery,
-            LegalTermScorer.ArticleIdQueryInfo queryInfo) {
-
+    private List<SearchResult> fuseAndRank(Map<String, HitScore> bm25Results,
+            Map<String, HitScore> knnResults, double alpha, int topK,
+            LegalTermScorer.ArticleIdQueryInfo queryInfo, SearchScope scope) {
         Set<String> allDocIds = new LinkedHashSet<>();
         allDocIds.addAll(bm25Results.keySet());
         allDocIds.addAll(knnResults.keySet());
 
-        double bm25Min = bm25Results.values().stream().mapToDouble(h -> h.score()).min().orElse(0.0);
-        double bm25Max = bm25Results.values().stream().mapToDouble(h -> h.score()).max().orElse(1.0);
-        double knnMin = knnResults.values().stream().mapToDouble(h -> h.score()).min().orElse(0.0);
-        double knnMax = knnResults.values().stream().mapToDouble(h -> h.score()).max().orElse(1.0);
+        double bm25Min = bm25Results.values().stream().mapToDouble(HitScore::score).min().orElse(0.0);
+        double bm25Max = bm25Results.values().stream().mapToDouble(HitScore::score).max().orElse(1.0);
+        double knnMin = knnResults.values().stream().mapToDouble(HitScore::score).min().orElse(0.0);
+        double knnMax = knnResults.values().stream().mapToDouble(HitScore::score).max().orElse(1.0);
 
         List<FusedDoc> fusedDocs = new ArrayList<>();
-
         for (String docId : allDocIds) {
             HitScore bm25Hit = bm25Results.get(docId);
             HitScore knnHit = knnResults.get(docId);
-
-            // Min-Max 归一化 (使用安全除法)
             double bm25Norm = bm25Hit != null ? normalizeSafe(bm25Hit.score(), bm25Min, bm25Max) : 0.0;
             double knnNorm = knnHit != null ? normalizeSafe(knnHit.score(), knnMin, knnMax) : 0.0;
-
-            // 核心融合公式
             double finalScore = alpha * bm25Norm + (1.0 - alpha) * knnNorm;
 
             HitScore primaryHit = bm25Hit != null ? bm25Hit : knnHit;
-            if (primaryHit == null) continue;
-
+            if (primaryHit == null) {
+                continue;
+            }
             String hitReason = buildHitReason(queryInfo, alpha, bm25Hit, knnHit);
             fusedDocs.add(new FusedDoc(primaryHit, finalScore, bm25Norm, knnNorm, alpha, hitReason));
         }
 
-        fusedDocs.sort((a, b) -> Double.compare(b.finalScore, a.finalScore));
+        fusedDocs.sort((a, b) -> Double.compare(b.finalScore(), a.finalScore()));
 
         List<SearchResult> results = new ArrayList<>();
         int limit = Math.min(topK, fusedDocs.size());
         for (int i = 0; i < limit; i++) {
             FusedDoc fd = fusedDocs.get(i);
-            HitScore hs = fd.hitScore;
-            
-            // 构建返回给前端的对象
+            HitScore hs = fd.hitScore();
             SearchResult sr = new SearchResult(
-                    hs.fileMd5(), hs.chunkId(), hs.textContent(), fd.finalScore,
+                    hs.fileMd5(), hs.chunkId(), hs.textContent(), fd.finalScore(),
                     hs.userId(), hs.orgTag(), hs.isPublic(), null,
-                    hs.pageNumber(), hs.anchorText(), "HYBRID_ADAPTIVE", hs.textContent()
-            );
+                    hs.pageNumber(), hs.anchorText(), "HYBRID_ADAPTIVE", hs.textContent());
             sr.setChunkLevel(hs.chunkLevel());
             sr.setPartName(hs.partName());
             sr.setChapterName(hs.chapterName());
             sr.setSectionName(hs.sectionName());
             sr.setArticleId(hs.articleId());
-            sr.setBm25NormScore(round(fd.bm25Norm));
-            sr.setKnnNormScore(round(fd.knnNorm));
-            sr.setAlpha(round(fd.alpha));
-            sr.setHitReason(fd.hitReason);
+            sr.setBm25NormScore(round(fd.bm25Norm()));
+            sr.setKnnNormScore(round(fd.knnNorm()));
+            sr.setAlpha(round(fd.alpha()));
+            sr.setHitReason(fd.hitReason());
+            sr.setDocumentType(hs.documentType());
+            sr.setChunkStrategy(hs.chunkStrategy());
+            sr.setCaseSection(hs.caseSection());
+            sr.setBlockId(hs.blockId());
+            sr.setParentBlockId(hs.parentBlockId());
+            sr.setContentType(hs.contentType());
+            sr.setSourceCorpus(scope == SearchScope.PRIVATE ? PRIVATE_CORPUS : PUBLIC_CORPUS);
+            sr.setSearchScope(scope.name());
             results.add(sr);
         }
         return results;
     }
 
-    // 安全归一化：防止 (max - min) 为 0 导致结果变 Infinity 或 NaN
     private double normalizeSafe(double score, double min, double max) {
         if (max - min < 1e-6) {
-            return 1.0; // 如果这批数据得分全一样，或者只有一条数据，直接给满分
+            return 1.0;
         }
-        return Math.max(0.0, Math.min(1.0, (score - min) / (max - min))); // 强制截断在 [0,1]
+        return Math.max(0.0, Math.min(1.0, (score - min) / (max - min)));
     }
 
-    /**
-     * 构建命中原因描述。
-     */
-    private String buildHitReason(LegalTermScorer.ArticleIdQueryInfo queryInfo,
-            double alpha, HitScore bm25Hit, HitScore knnHit) {
+    private String buildHitReason(LegalTermScorer.ArticleIdQueryInfo queryInfo, double alpha,
+            HitScore bm25Hit, HitScore knnHit) {
         StringBuilder sb = new StringBuilder();
         if (!queryInfo.matchedArticleIds().isEmpty()) {
             sb.append("精确条文号匹配（")
@@ -467,103 +476,170 @@ public class HybridSearchService {
     }
 
     // ============================================
-    // 纯文本搜索（保留，作为向量生成失败时的后备）
+    // 纯文本搜索（向量生成失败时的后备）
     // ============================================
 
-    /**
-     * 仅使用文本匹配的带权限搜索方法。
-     */
-    private List<SearchResult> textOnlySearchWithPermission(String query, String userDbId,
-            List<String> userEffectiveTags, int topK, String[] indices) {
+    private List<SearchResult> textOnlySearchWithPermission(String query, UserContext userContext,
+            int topK, SearchScope scope) {
         try {
-            logger.debug("开始执行纯文本搜索，用户数据库ID: {}, 标签: {}", userDbId, userEffectiveTags);
-
             SearchResponse<EsDocument> response = esClient.search(s -> s
-                    .index(Arrays.asList(indices))
-                    .query(q -> q
-                            .bool(b -> b
-                                    .must(m -> m
-                                            .match(ma -> ma
-                                                    .field("textContent")
-                                                    .query(query)
-                                            )
-                                    )
-                                    .filter(f -> f
-                                            .bool(bf -> {
-                                                buildPermissionFilterInPlace(bf, userDbId, userEffectiveTags);
-                                                return bf;
-                                            })
-                                    )
-                            )
-                    )
-                    .minScore(0.3d)
+                    .index(scope.index())
+                    .query(q -> q.bool(b -> b
+                            .must(m -> m.match(ma -> ma.field("textContent").query(query)))
+                            .filter(f -> f.bool(bf -> {
+                                buildPermissionFilterInPlace(bf, userContext);
+                                applyScopeFilter(bf, scope);
+                                return bf;
+                            }))
+                    ))
+                    .minScore(scope == SearchScope.PRIVATE ? 0.1d : 0.3d)
                     .size(topK),
-                    EsDocument.class
-            );
+                    EsDocument.class);
 
-            logger.debug("纯文本查询执行完成，命中数量: {}, 最大分数: {}",
-                response.hits().total().value(), response.hits().maxScore());
-
-            List<SearchResult> results = response.hits().hits().stream()
-                    .map(hit -> {
-                        assert hit.source() != null;
-                        EsDocument doc = hit.source();
-                        SearchResult sr = new SearchResult(
-                                doc.getFileMd5(),
-                                doc.getChunkId(),
-                                doc.getTextContent(),
-                                hit.score(),
-                                doc.getUserId(),
-                                doc.getOrgTag(),
-                                doc.isPublic(),
-                                null,
-                                doc.getPageNumber(),
-                                doc.getAnchorText(),
-                                "TEXT_ONLY",
-                                doc.getTextContent()
-                        );
-                        // 携带法律层级元数据
-                        sr.setChunkLevel(doc.getChunkLevel());
-                        sr.setPartName(doc.getPartName());
-                        sr.setChapterName(doc.getChapterName());
-                        sr.setSectionName(doc.getSectionName());
-                        sr.setArticleId(doc.getArticleId());
-                        return sr;
-                    })
-                    .toList();
-
-            logger.debug("返回纯文本搜索结果数量: {}", results.size());
-            attachFileNames(results);
+            List<SearchResult> results = new ArrayList<>(response.hits().hits().stream()
+                    .map(hit -> toSearchResult(hit, scope, "TEXT_ONLY"))
+                    .filter(java.util.Objects::nonNull)
+                    .toList());
+            expandParentContexts(results, scope, userContext);
             return results;
         } catch (Exception e) {
-            logger.error("纯文本搜索失败", e);
+            logger.error("纯文本搜索失败，scope: {}", scope, e);
             return new ArrayList<>();
         }
     }
 
+    private SearchResult toSearchResult(Hit<EsDocument> hit, SearchScope scope, String retrievalMode) {
+        if (hit.source() == null) {
+            return null;
+        }
+        EsDocument doc = hit.source();
+        String documentType = doc.getDocumentType();
+        if (documentType == null || documentType.isBlank()) {
+            documentType = "private".equals(doc.getChunkLevel())
+                    ? DocumentType.PRIVATE_LEGAL.name()
+                    : DocumentType.STRUCTURED_LAW.name();
+        }
+        SearchResult sr = new SearchResult(
+                doc.getFileMd5(), doc.getChunkId(), doc.getTextContent(),
+                hit.score() != null ? hit.score() : 0.0,
+                doc.getUserId(), doc.getOrgTag(), doc.isPublic(), null,
+                doc.getPageNumber(), doc.getAnchorText(), retrievalMode, doc.getTextContent());
+        sr.setChunkLevel(doc.getChunkLevel());
+        sr.setPartName(doc.getPartName());
+        sr.setChapterName(doc.getChapterName());
+        sr.setSectionName(doc.getSectionName());
+        sr.setArticleId(doc.getArticleId());
+        sr.setDocumentType(documentType);
+        sr.setChunkStrategy(doc.getChunkStrategy());
+        sr.setCaseSection(doc.getCaseSection());
+        sr.setBlockId(doc.getBlockId());
+        sr.setParentBlockId(doc.getParentBlockId());
+        sr.setContentType(doc.getContentType());
+        sr.setSourceCorpus(scope == SearchScope.PRIVATE ? PRIVATE_CORPUS : PUBLIC_CORPUS);
+        sr.setSearchScope(scope.name());
+        return sr;
+    }
+
     // ========================================
-    // 向后兼容：无权限过滤的搜索方法
+    // 父子分块：命中子块后回补父段上下文
     // ========================================
 
-    /**
-     * 原始搜索方法，不包含权限过滤，保留向后兼容性。
-     */
+    private void expandParentContexts(List<SearchResult> results, SearchScope scope, UserContext userContext) {
+        if (results == null || results.isEmpty()) {
+            return;
+        }
+        Set<String> parentIds = results.stream()
+                .map(SearchResult::getParentBlockId)
+                .filter(java.util.Objects::nonNull)
+                .filter(id -> !id.isBlank())
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        if (parentIds.isEmpty()) {
+            return;
+        }
+        try {
+            Map<String, String> parentTexts = documentChunkContextService.findParentTexts(
+                    parentIds, scope == SearchScope.PRIVATE, userContext.userDbId());
+            results.forEach(result -> {
+                String parentText = parentTexts.get(result.getParentBlockId());
+                if (parentText != null && !parentText.isBlank()) {
+                    result.setContextText(parentText);
+                }
+            });
+            logger.info("父子上下文回补完成，scope={}, 命中子块数={}, 父块数={}",
+                    scope, results.size(), parentTexts.size());
+        } catch (Exception e) {
+            logger.warn("父子上下文回补失败，回退子块文本: {}", e.getMessage());
+        }
+    }
+
+    // ========================================
+    // 混合意图结果合并
+    // ========================================
+
+    private List<SearchResult> mergeMixed(List<SearchResult> publicResults,
+            List<SearchResult> privateResults, int topK) {
+        List<SearchResult> merged = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+
+        int perCorpus = Math.max(1, topK / 2);
+        List<SearchResult> publicTop = publicResults.stream().limit(perCorpus).toList();
+        List<SearchResult> privateTop = privateResults.stream().limit(perCorpus).toList();
+        addUnique(merged, seen, publicTop);
+        addUnique(merged, seen, privateTop);
+
+        List<SearchResult> rest = new ArrayList<>();
+        rest.addAll(publicResults);
+        rest.addAll(privateResults);
+        rest.sort(Comparator.comparing(SearchResult::getScore,
+                Comparator.nullsLast(Comparator.reverseOrder())));
+        for (SearchResult result : rest) {
+            if (merged.size() >= topK) {
+                break;
+            }
+            addUnique(merged, seen, List.of(result));
+        }
+
+        merged.sort(Comparator.comparing(SearchResult::getScore,
+                Comparator.nullsLast(Comparator.reverseOrder())));
+        if (merged.size() > topK) {
+            return new ArrayList<>(merged.subList(0, topK));
+        }
+        return merged;
+    }
+
+    private void addUnique(List<SearchResult> target, Set<String> seen, List<SearchResult> candidates) {
+        for (SearchResult result : candidates) {
+            String key = result.getFileMd5() + "#" + result.getDocumentType() + "#" + result.getChunkId();
+            if (seen.add(key)) {
+                target.add(result);
+            }
+        }
+    }
+
+    private void attachIntentMetadata(List<SearchResult> results, RetrievalIntent intent, SearchScope scope) {
+        for (SearchResult result : results) {
+            result.setSearchScope(scope.name());
+            result.setIntentCategory(intent.category() == null
+                    ? IntentCategory.PUBLIC.getApiValue() : intent.category().getApiValue());
+            result.setIntentConfidence(intent.confidence());
+            result.setIntentReason(intent.reason());
+        }
+    }
+
+    // ========================================
+    // 无权限搜索（仅公开法典，向后兼容）
+    // ========================================
+
     public List<SearchResult> search(String query, int topK) {
         try {
-            logger.debug("开始混合检索（无权限过滤），查询: {}, topK: {}", query, topK);
-
             LegalTermScorer.ArticleIdQueryInfo queryInfo = termScorer.analyzeQuery(query);
-            double alpha = termScorer.computeAlpha(queryInfo.articleIdDensity(), queryInfo.legalTermDensity());
-
+            double alpha = termScorer.computeAlpha(queryInfo);
             final List<Float> queryVector = embedToVectorList(query, "system");
             if (queryVector == null) {
-                logger.warn("向量生成失败，仅使用文本匹配进行搜索");
                 return textOnlySearch(query, topK);
             }
 
-            int recallK = topK * RECALL_FACTOR;
-
-            // 并发双路查询
+            int recallK = Math.max(topK, topK * RECALL_FACTOR);
             CompletableFuture<Map<String, HitScore>> bm25Future = CompletableFuture.supplyAsync(() -> {
                 try {
                     return executeBm25QueryNoPermission(query, recallK);
@@ -572,7 +648,6 @@ public class HybridSearchService {
                     return Collections.emptyMap();
                 }
             });
-
             CompletableFuture<Map<String, HitScore>> knnFuture = CompletableFuture.supplyAsync(() -> {
                 try {
                     return executeKnnQueryNoPermission(queryVector, recallK);
@@ -582,25 +657,17 @@ public class HybridSearchService {
                 }
             });
 
-            Map<String, HitScore> bm25Results = bm25Future.join();
-            Map<String, HitScore> knnResults = knnFuture.join();
-
-            return fuseAndRank(bm25Results, knnResults, alpha, topK, query, queryInfo);
+            return fuseAndRank(bm25Future.join(), knnFuture.join(), alpha, topK,
+                    queryInfo, SearchScope.PUBLIC);
         } catch (Exception e) {
             logger.error("搜索失败", e);
-            try {
-                return textOnlySearch(query, topK);
-            } catch (Exception fallbackError) {
-                logger.error("后备搜索也失败", fallbackError);
-                throw new RuntimeException("搜索完全失败", fallbackError);
-            }
+            throw new RuntimeException("搜索完全失败", e);
         }
     }
 
-    private Map<String, HitScore> executeBm25QueryNoPermission(String query, int recallK)
-            throws Exception {
+    private Map<String, HitScore> executeBm25QueryNoPermission(String query, int recallK) throws Exception {
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index("knowledge_base");
+            s.index(ElasticsearchService.PUBLIC_INDEX);
             s.size(recallK);
             s.query(q -> q.match(m -> m.field("textContent").query(query)));
             return s;
@@ -611,7 +678,7 @@ public class HybridSearchService {
     private Map<String, HitScore> executeKnnQueryNoPermission(List<Float> queryVector, int recallK)
             throws Exception {
         SearchResponse<EsDocument> response = esClient.search(s -> {
-            s.index("knowledge_base");
+            s.index(ElasticsearchService.PUBLIC_INDEX);
             s.knn(kn -> kn
                     .field("vector")
                     .queryVector(queryVector)
@@ -626,35 +693,33 @@ public class HybridSearchService {
 
     private List<SearchResult> textOnlySearch(String query, int topK) throws Exception {
         SearchResponse<EsDocument> response = esClient.search(s -> s
-                .index("knowledge_base")
+                .index(ElasticsearchService.PUBLIC_INDEX)
                 .query(q -> q.match(m -> m.field("textContent").query(query)))
                 .size(topK),
                 EsDocument.class
         );
-
         return response.hits().hits().stream()
                 .map(hit -> {
-                    assert hit.source() != null;
+                    if (hit.source() == null) {
+                        return null;
+                    }
                     EsDocument doc = hit.source();
                     SearchResult sr = new SearchResult(
-                            doc.getFileMd5(),
-                            doc.getChunkId(),
-                            doc.getTextContent(),
-                            hit.score(),
-                            null, null, false,
-                            null,
-                            doc.getPageNumber(),
-                            doc.getAnchorText(),
-                            "TEXT_ONLY",
-                            doc.getTextContent()
-                    );
+                            doc.getFileMd5(), doc.getChunkId(), doc.getTextContent(),
+                            hit.score() != null ? hit.score() : 0.0,
+                            null, null, false, null,
+                            doc.getPageNumber(), doc.getAnchorText(), "TEXT_ONLY", doc.getTextContent());
                     sr.setChunkLevel(doc.getChunkLevel());
                     sr.setPartName(doc.getPartName());
                     sr.setChapterName(doc.getChapterName());
                     sr.setSectionName(doc.getSectionName());
                     sr.setArticleId(doc.getArticleId());
+                    sr.setDocumentType(DocumentType.STRUCTURED_LAW.name());
+                    sr.setSourceCorpus(PUBLIC_CORPUS);
+                    sr.setSearchScope(SearchScope.PUBLIC.name());
                     return sr;
                 })
+                .filter(java.util.Objects::nonNull)
                 .toList();
     }
 
@@ -662,69 +727,48 @@ public class HybridSearchService {
     // 向量生成
     // ========================================
 
-    /**
-     * 生成查询向量，返回 List<Float>，失败时返回 null
-     */
     private List<Float> embedToVectorList(String text, String requesterId) {
         try {
-            List<float[]> vecs = embeddingClient.embed(List.of(text), requesterId,
+            List<float[]> vectors = embeddingClient.embed(List.of(text), requesterId,
                     EmbeddingClient.UsageType.QUERY);
-            if (vecs == null || vecs.isEmpty()) {
+            if (vectors == null || vectors.isEmpty()) {
                 logger.warn("生成的向量为空");
                 return null;
             }
-            float[] raw = vecs.get(0);
+            float[] raw = vectors.get(0);
             List<Float> list = new ArrayList<>(raw.length);
-            for (float v : raw) {
-                list.add(v);
+            for (float value : raw) {
+                list.add(value);
             }
             return list;
         } catch (Exception e) {
-            logger.error("生成向量失败", e);
+            logger.error("生成查询向量失败", e);
             return null;
         }
     }
 
     // ========================================
-    // 权限辅助方法（保留原有逻辑）
+    // 权限辅助方法
     // ========================================
 
-    private List<String> getUserEffectiveOrgTags(String userId) {
-        logger.debug("获取用户有效组织标签，用户ID: {}", userId);
+    private UserContext resolveUserContext(String userId) {
         try {
             User user;
             try {
                 Long userIdLong = Long.parseLong(userId);
                 user = userRepository.findById(userIdLong)
-                    .orElseThrow(() -> new CustomException("User not found with ID: " + userId, HttpStatus.NOT_FOUND));
+                        .orElseThrow(() -> new CustomException("User not found with ID: " + userId,
+                                HttpStatus.NOT_FOUND));
             } catch (NumberFormatException e) {
                 user = userRepository.findByUsername(userId)
-                    .orElseThrow(() -> new CustomException("User not found: " + userId, HttpStatus.NOT_FOUND));
+                        .orElseThrow(() -> new CustomException("User not found: " + userId,
+                                HttpStatus.NOT_FOUND));
             }
-            return orgTagCacheService.getUserEffectiveOrgTags(user.getUsername());
+            List<String> effectiveTags = orgTagCacheService.getUserEffectiveOrgTags(user.getUsername());
+            return new UserContext(user.getId().toString(), effectiveTags);
         } catch (Exception e) {
-            logger.error("获取用户有效组织标签失败: {}", e.getMessage(), e);
-            return Collections.emptyList();
-        }
-    }
-
-    private String getUserDbId(String userId) {
-        logger.debug("获取用户数据库ID，用户ID: {}", userId);
-        try {
-            User user;
-            try {
-                Long userIdLong = Long.parseLong(userId);
-                user = userRepository.findById(userIdLong)
-                    .orElseThrow(() -> new CustomException("User not found with ID: " + userId, HttpStatus.NOT_FOUND));
-                return userIdLong.toString();
-            } catch (NumberFormatException e) {
-                user = userRepository.findByUsername(userId)
-                    .orElseThrow(() -> new CustomException("User not found: " + userId, HttpStatus.NOT_FOUND));
-                return user.getId().toString();
-            }
-        } catch (Exception e) {
-            logger.error("获取用户数据库ID失败: {}", e.getMessage(), e);
-            throw new RuntimeException("获取用户数据库ID失败", e);
+            logger.error("解析用户权限上下文失败: {}", e.getMessage(), e);
+            throw new RuntimeException("解析用户权限上下文失败", e);
         }
     }
 
@@ -737,10 +781,18 @@ public class HybridSearchService {
                     .map(SearchResult::getFileMd5)
                     .collect(Collectors.toSet());
             List<FileUpload> uploads = fileUploadRepository.findByFileMd5In(new ArrayList<>(md5Set));
-            Map<String, String> md5ToName = uploads.stream()
-                    .collect(Collectors.toMap(FileUpload::getFileMd5, FileUpload::getFileName,
-                            (existing, replacement) -> existing));
-            results.forEach(r -> r.setFileName(md5ToName.get(r.getFileMd5())));
+            Map<String, String> fileNameByKey = new LinkedHashMap<>();
+            Map<String, String> fileNameByMd5 = new LinkedHashMap<>();
+            for (FileUpload upload : uploads) {
+                String key = upload.getFileMd5() + "|" + upload.getDocumentTypeEnum().name();
+                fileNameByKey.putIfAbsent(key, upload.getFileName());
+                fileNameByMd5.putIfAbsent(upload.getFileMd5(), upload.getFileName());
+            }
+            results.forEach(result -> {
+                String key = result.getFileMd5() + "|" + DocumentType.from(result.getDocumentType()).name();
+                result.setFileName(fileNameByKey.getOrDefault(key,
+                        fileNameByMd5.get(result.getFileMd5())));
+            });
         } catch (Exception e) {
             logger.error("补充文件名失败", e);
         }
@@ -750,51 +802,30 @@ public class HybridSearchService {
     // 内部数据结构
     // ========================================
 
-    private SearchScope resolveSearchScope(String query,
-            LegalTermScorer.ArticleIdQueryInfo queryInfo) {
-        AliyunDecisionClient.DecisionResult decision = aliyunDecisionClient.classify(query, "", List.of());
-        if (decision.available() && decision.confidence() >= decisionConfidenceThreshold) {
-            return switch (decision.category()) {
-                case "PUBLIC" -> SearchScope.PUBLIC;
-                case "PRIVATE" -> SearchScope.PRIVATE;
-                case "BOTH" -> SearchScope.BOTH;
-                default -> fallbackSearchScope(query, queryInfo);
-            };
-        }
-        return fallbackSearchScope(query, queryInfo);
-    }
-
-    private SearchScope fallbackSearchScope(String query,
-            LegalTermScorer.ArticleIdQueryInfo queryInfo) {
-        if (queryInfo != null && !queryInfo.matchedArticleIds().isEmpty()) {
-            return SearchScope.PUBLIC;
-        }
-        String normalized = query == null ? "" : query.toLowerCase(Locale.ROOT);
-        if (normalized.contains("我的") || normalized.contains("上传")
-                || normalized.contains("合同") || normalized.contains("诉状")
-                || normalized.contains("报告") || normalized.contains("材料")) {
-            return SearchScope.PRIVATE;
-        }
-        return SearchScope.BOTH;
-    }
-
-    private String[] indicesFor(SearchScope scope) {
-        return switch (scope) {
-            case PUBLIC -> new String[]{ElasticsearchService.PUBLIC_INDEX};
-            case PRIVATE -> new String[]{ElasticsearchService.PRIVATE_INDEX};
-            case BOTH -> new String[]{ElasticsearchService.PUBLIC_INDEX, ElasticsearchService.PRIVATE_INDEX};
-        };
-    }
-
     private enum SearchScope {
         PUBLIC,
         PRIVATE,
-        BOTH
+        BOTH;
+
+        static SearchScope from(RetrievalIntent intent) {
+            if (intent == null || intent.category() == null) {
+                return PUBLIC;
+            }
+            return switch (intent.category()) {
+                case PUBLIC -> PUBLIC;
+                case PRIVATE -> PRIVATE;
+                case MIXED -> BOTH;
+            };
+        }
+
+        String index() {
+            return this == PRIVATE ? ElasticsearchService.PRIVATE_INDEX : ElasticsearchService.PUBLIC_INDEX;
+        }
     }
 
-    /**
-     * 单路查询命中的文档得分及元数据。
-     */
+    private record UserContext(String userDbId, List<String> effectiveTags) {
+    }
+
     private record HitScore(
             double score,
             String fileMd5,
@@ -809,12 +840,16 @@ public class HybridSearchService {
             String partName,
             String chapterName,
             String sectionName,
-            String articleId
-    ) {}
+            String articleId,
+            String documentType,
+            String chunkStrategy,
+            String caseSection,
+            String blockId,
+            String parentBlockId,
+            String contentType
+    ) {
+    }
 
-    /**
-     * 融合后的文档得分。
-     */
     private record FusedDoc(
             HitScore hitScore,
             double finalScore,
@@ -822,5 +857,6 @@ public class HybridSearchService {
             double knnNorm,
             double alpha,
             String hitReason
-    ) {}
+    ) {
+    }
 }

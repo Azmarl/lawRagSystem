@@ -1,15 +1,20 @@
 package com.yizhaoqi.rag.service;
 
+import com.yizhaoqi.rag.chunker.DocumentType;
 import com.yizhaoqi.rag.client.EmbeddingClient;
-import com.yizhaoqi.rag.model.DocumentVector;
 import com.yizhaoqi.rag.entity.EsDocument;
 import com.yizhaoqi.rag.entity.TextChunk;
+import com.yizhaoqi.rag.model.DocumentVector;
+import com.yizhaoqi.rag.model.FileUpload;
 import com.yizhaoqi.rag.repository.DocumentVectorRepository;
+import com.yizhaoqi.rag.repository.FileUploadRepository;
+import com.yizhaoqi.rag.repository.PrivateDocumentVectorRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.IntStream;
@@ -29,12 +34,14 @@ public class VectorizationService {
     @Autowired
     private DocumentVectorRepository documentVectorRepository;
 
+    @Autowired
+    private PrivateDocumentVectorRepository privateDocumentVectorRepository;
+
+    @Autowired
+    private FileUploadRepository fileUploadRepository;
+
     /**
-     * 执行向量化操作
-     * @param fileMd5 文件指纹
-     * @param userId 上传用户ID
-     * @param orgTag 组织标签
-     * @param isPublic 是否公开
+     * 执行向量化操作（向后兼容：自动读取文件记录中的文档类型）。
      */
     public void vectorize(String fileMd5, String userId, String orgTag, boolean isPublic) {
         vectorizeWithUsage(fileMd5, userId, orgTag, isPublic, userId);
@@ -44,24 +51,33 @@ public class VectorizationService {
         vectorizeWithUsage(fileMd5, userId, orgTag, isPublic, requesterId);
     }
 
-    public VectorizationUsageResult vectorizeWithUsage(String fileMd5, String userId, String orgTag, boolean isPublic, String requesterId) {
+    public VectorizationUsageResult vectorizeWithUsage(String fileMd5, String userId, String orgTag,
+            boolean isPublic, String requesterId) {
+        DocumentType documentType = fileUploadRepository
+                .findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
+                .map(FileUpload::getDocumentTypeEnum)
+                .orElse(DocumentType.STRUCTURED_LAW);
+        return vectorizeWithUsage(fileMd5, userId, orgTag, isPublic, requesterId, documentType);
+    }
+
+    public VectorizationUsageResult vectorizeWithUsage(String fileMd5, String userId, String orgTag,
+            boolean isPublic, String requesterId, DocumentType documentType) {
+        DocumentType resolvedType = documentType == null ? DocumentType.STRUCTURED_LAW : documentType;
         try {
-            logger.info("开始向量化文件，fileMd5: {}, userId: {}, orgTag: {}, isPublic: {}", 
-                       fileMd5, userId, orgTag, isPublic);
-                       
-            // 获取文件分块内容（含法律层级元数据）
-            List<TextChunk> chunks = fetchTextChunks(fileMd5);
+            logger.info("开始向量化文件，fileMd5: {}, userId: {}, orgTag: {}, isPublic: {}, documentType: {}",
+                    fileMd5, userId, orgTag, isPublic, resolvedType);
+
+            // 获取对应隔离表/索引中的分块
+            List<TextChunk> chunks = fetchTextChunks(fileMd5, userId, resolvedType);
             if (chunks == null || chunks.isEmpty()) {
-                logger.warn("未找到分块内容，fileMd5: {}", fileMd5);
+                logger.warn("未找到分块内容，fileMd5: {}, documentType: {}", fileMd5, resolvedType);
                 return new VectorizationUsageResult(0, 0, embeddingClient.currentModelVersion());
             }
 
-            // 提取文本内容
             List<String> texts = chunks.stream()
                     .map(TextChunk::getContent)
                     .toList();
 
-            // 调用外部模型生成向量
             EmbeddingClient.EmbeddingUsageResult embeddingResult = embeddingClient.embedWithUsage(
                     texts,
                     requesterId,
@@ -69,11 +85,10 @@ public class VectorizationService {
             );
             List<float[]> vectors = embeddingResult.vectors();
 
-            // 构建 Elasticsearch 文档并存储（携带法律层级元数据）
             List<EsDocument> esDocuments = IntStream.range(0, chunks.size())
                     .mapToObj(i -> {
                         TextChunk chunk = chunks.get(i);
-                        return new EsDocument(
+                        EsDocument esDocument = new EsDocument(
                                 UUID.randomUUID().toString(),
                                 fileMd5,
                                 chunk.getChunkId(),
@@ -84,8 +99,7 @@ public class VectorizationService {
                                 embeddingResult.modelVersion(),
                                 userId,
                                 orgTag,
-                                isPublic,
-                                // 法律层级元数据
+                                !resolvedType.isPrivateDocument() && isPublic,
                                 chunk.getChunkLevel(),
                                 chunk.getPartName(),
                                 chunk.getChapterName(),
@@ -93,23 +107,31 @@ public class VectorizationService {
                                 chunk.getArticleId(),
                                 chunk.getArticleIdDensity(),
                                 chunk.getLegalTermDensity(),
-                                "private".equals(chunk.getChunkLevel()) ? "PRIVATE_LEGAL" : "STRUCTURED_LAW",
+                                resolvedType.name(),
                                 chunk.getParentBlockId(),
                                 chunk.getChunkPosition()
                         );
+                        esDocument.setChunkStrategy(chunk.getChunkStrategy());
+                        esDocument.setCaseSection(chunk.getCaseSection());
+                        esDocument.setBlockId(chunk.getBlockId());
+                        esDocument.setChunkRole(chunk.getChunkRole());
+                        esDocument.setContentType(chunk.getContentType());
+                        return esDocument;
                     })
                     .toList();
 
-            elasticsearchService.bulkIndex(esDocuments); // 批量存储到 Elasticsearch
+            elasticsearchService.bulkIndex(esDocuments);
 
-            logger.info("向量化完成，fileMd5: {}", fileMd5);
+            logger.info("向量化完成，fileMd5: {}, documentType: {}, index: {}",
+                    fileMd5, resolvedType,
+                    resolvedType.isPrivateDocument() ? ElasticsearchService.PRIVATE_INDEX : ElasticsearchService.PUBLIC_INDEX);
             return new VectorizationUsageResult(
                     embeddingResult.totalTokens(),
                     chunks.size(),
                     embeddingResult.modelVersion()
             );
         } catch (Exception e) {
-            logger.error("向量化失败，fileMd5: {}", fileMd5, e);
+            logger.error("向量化失败，fileMd5: {}, documentType: {}", fileMd5, resolvedType, e);
             String message = e.getMessage();
             if (message == null || message.isBlank()) {
                 throw new RuntimeException("向量化失败", e);
@@ -117,19 +139,22 @@ public class VectorizationService {
             throw new RuntimeException("向量化失败: " + message, e);
         }
     }
-    
 
     /**
-     * 获取文件分块内容（含法律层级元数据）
-     * @param fileMd5 文件指纹
-     * @return 分块内容列表
+     * 获取文件分块内容（私人案件从独立表读取）。
      */
-    private List<TextChunk> fetchTextChunks(String fileMd5) {
-        // 调用 Repository 查询数据
-        List<DocumentVector> vectors = documentVectorRepository.findByFileMd5OrderByChunkIdAsc(fileMd5);
+    private List<TextChunk> fetchTextChunks(String fileMd5, String userId, DocumentType documentType) {
+        List<DocumentVector> vectors = new ArrayList<>();
+        if (documentType.isPrivateDocument()) {
+            vectors.addAll(privateDocumentVectorRepository
+                    .findByFileMd5AndUserIdOrderByChunkIdAsc(fileMd5, userId));
+        } else {
+            vectors.addAll(documentVectorRepository.findByFileMd5OrderByChunkIdAsc(fileMd5));
+        }
 
-        // 转换为 TextChunk 列表，携带法律层级元数据
         return vectors.stream()
+                // 父块只用于上下文回补，不做 Embedding / 不进入 ES，避免父块被直接召回
+                .filter(vector -> !"PARENT".equalsIgnoreCase(vector.getChunkRole()))
                 .map(vector -> {
                     TextChunk chunk = new TextChunk(
                             vector.getChunkId(),
@@ -137,7 +162,6 @@ public class VectorizationService {
                             vector.getPageNumber(),
                             vector.getAnchorText()
                     );
-                    // 法律层级元数据
                     chunk.setChunkLevel(vector.getChunkLevel());
                     chunk.setPartName(vector.getPartName());
                     chunk.setChapterName(vector.getChapterName());
@@ -147,6 +171,13 @@ public class VectorizationService {
                     chunk.setLegalTermDensity(vector.getLegalTermDensity());
                     chunk.setParentBlockId(vector.getParentBlockId());
                     chunk.setChunkPosition(vector.getChunkPosition());
+                    chunk.setDocumentType(vector.getDocumentType() == null
+                            ? documentType.name() : vector.getDocumentType());
+                    chunk.setChunkStrategy(vector.getChunkStrategy());
+                    chunk.setCaseSection(vector.getCaseSection());
+                    chunk.setBlockId(vector.getBlockId());
+                    chunk.setChunkRole(vector.getChunkRole());
+                    chunk.setContentType(vector.getContentType());
                     return chunk;
                 })
                 .toList();

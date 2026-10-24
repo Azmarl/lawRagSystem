@@ -7,6 +7,7 @@ import com.yizhaoqi.rag.model.User;
 import com.yizhaoqi.rag.repository.ChunkInfoRepository;
 import com.yizhaoqi.rag.repository.DocumentVectorRepository;
 import com.yizhaoqi.rag.repository.FileUploadRepository;
+import com.yizhaoqi.rag.repository.PrivateDocumentVectorRepository;
 import com.yizhaoqi.rag.repository.UserRepository;
 import com.yizhaoqi.rag.config.MinioConfig;
 import io.minio.GetObjectArgs;
@@ -34,6 +35,7 @@ import java.util.HashMap;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +65,9 @@ public class DocumentService {
 
     @Autowired
     private DocumentVectorRepository documentVectorRepository;
+
+    @Autowired
+    private PrivateDocumentVectorRepository privateDocumentVectorRepository;
 
     @Autowired
     private ChunkInfoRepository chunkInfoRepository;
@@ -120,62 +125,59 @@ public class DocumentService {
             uploadService.deleteFileMark(fileMd5, fileUpload.getUserId());
 
             try {
-                chunkInfoRepository.deleteByFileMd5(fileMd5);
-                logger.info("成功删除文档分片记录: {}", fileMd5);
+                String chunkKey = com.yizhaoqi.rag.utils.UploadChunkKey.of(
+                        fileMd5, fileUpload.getUserId(), fileUpload.getDocumentTypeEnum());
+                chunkInfoRepository.deleteByFileMd5(chunkKey);
+                logger.info("成功删除文档分片记录: fileMd5={}, chunkKey={}", fileMd5, chunkKey);
             } catch (Exception e) {
                 logger.error("删除文档分片记录时出错: {}", fileMd5, e);
             }
 
-            // 1. 删除Elasticsearch中的数据
+            // 1. 删除Elasticsearch中的数据（私人文档只删当前用户，避免相同 MD5 互相影响）
             try {
-                elasticsearchService.deleteByFileMd5(fileMd5);
-                logger.info("成功从Elasticsearch删除文档: {}", fileMd5);
+                if (fileUpload.isPrivateDocument()) {
+                    elasticsearchService.deletePrivateByFileMd5AndUserId(fileMd5, fileUpload.getUserId());
+                } else {
+                    elasticsearchService.deletePublicByFileMd5(fileMd5);
+                }
+                logger.info("成功从Elasticsearch删除文档: fileMd5={}, documentType={}",
+                        fileMd5, fileUpload.getDocumentType());
             } catch (Exception e) {
                 logger.error("从Elasticsearch删除文档时出错: {}", fileMd5, e);
                 // 继续删除其他数据
             }
-            
-            // 2. 删除MinIO中的文件（使用MD5作为对象路径）
+
+            // 2. 删除MinIO中的文件（根据文档类型路由到公开/私人 bucket）
             try {
-                String objectName = "merged/" + fileUpload.getFileMd5();
-                minioClient.removeObject(
-                        RemoveObjectArgs.builder()
-                                .bucket("uploads")
-                                .object(objectName)
-                                .build()
-                );
-                logger.info("成功从MinIO删除文件: {}", objectName);
+                uploadService.deleteMergedFile(fileUpload);
+                logger.info("成功从MinIO删除文件: fileMd5={}, documentType={}, bucket={}",
+                        fileMd5, fileUpload.getDocumentType(), fileUpload.getStorageBucket());
             } catch (Exception e) {
-                logger.warn("使用MD5路径删除文件失败，尝试使用文件名路径: {}", fileMd5);
-                // 降级：尝试使用旧的文件名路径（兼容旧数据）
-                try {
-                    String oldObjectName = "merged/" + fileUpload.getFileName();
-                    minioClient.removeObject(
-                            RemoveObjectArgs.builder()
-                                    .bucket("uploads")
-                                    .object(oldObjectName)
-                                    .build()
-                    );
-                    logger.info("使用旧路径成功从MinIO删除文件: {}", oldObjectName);
-                } catch (Exception ex) {
-                    logger.error("从MinIO删除文件时出错（新旧路径都失败）: {}", fileMd5, ex);
-                    // 继续删除其他数据
-                }
+                logger.error("从MinIO删除文件时出错: fileMd5={}, documentType={}", fileMd5,
+                        fileUpload.getDocumentType(), e);
+                // 继续删除其他数据
             }
 
             invalidatePdfSinglePagePreviewCache(fileMd5);
-            
-            // 3. 删除DocumentVector记录
+
+            // 3. 删除DocumentVector记录（公开表 + 私人表）
             try {
                 documentVectorRepository.deleteByFileMd5(fileMd5);
+                if (privateDocumentVectorRepository != null && fileUpload.isPrivateDocument()) {
+                    privateDocumentVectorRepository.deleteByFileMd5AndUserId(fileMd5, fileUpload.getUserId());
+                }
                 logger.info("成功删除文档向量记录: {}", fileMd5);
             } catch (Exception e) {
                 logger.error("删除文档向量记录时出错: {}", fileMd5, e);
                 // 继续删除其他数据
             }
             
-            // 4. 删除FileUpload记录
-            fileUploadRepository.deleteByFileMd5(fileMd5);
+            // 4. 删除FileUpload记录（私人文档只删当前用户的记录）
+            if (fileUpload.isPrivateDocument()) {
+                fileUploadRepository.delete(fileUpload);
+            } else {
+                fileUploadRepository.deleteByFileMd5(fileMd5);
+            }
             logger.info("成功删除文件上传记录: {}", fileMd5);
             
             logger.info("文档删除完成: {}", fileMd5);
@@ -187,26 +189,42 @@ public class DocumentService {
 
     @Transactional
     public VectorizationService.VectorizationUsageResult reindexDocument(String fileMd5, String requesterId) {
-        logger.info("开始重建文档索引: fileMd5={}, requesterId={}", fileMd5, requesterId);
+        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                .orElseThrow(() -> new RuntimeException("文件不存在"));
+        return reindexDocument(fileUpload, requesterId);
+    }
+
+    /**
+     * 按明确的文件记录重建索引，避免相同 MD5 的不同用户/文档类型串记录。
+     */
+    @Transactional
+    public VectorizationService.VectorizationUsageResult reindexDocument(FileUpload fileUpload, String requesterId) {
+        String fileMd5 = fileUpload.getFileMd5();
+        logger.info("开始重建文档索引: fileMd5={}, requesterId={}, documentType={}",
+                fileMd5, requesterId, fileUpload.getDocumentType());
 
         if (isDocumentDeleted(fileMd5)) {
             throw new IllegalStateException("文件已被删除，无法重建索引");
         }
 
-        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
-                .orElseThrow(() -> new RuntimeException("文件不存在"));
-
         markVectorizationProcessing(fileUpload, true);
 
-        try (InputStream fileStream = uploadService.getMergedFileStream(fileMd5)) {
+        try (InputStream fileStream = uploadService.getMergedFileStream(fileUpload)) {
             try {
-                elasticsearchService.deleteByFileMd5(fileMd5);
+                if (fileUpload.isPrivateDocument()) {
+                    elasticsearchService.deletePrivateByFileMd5AndUserId(fileMd5, fileUpload.getUserId());
+                } else {
+                    elasticsearchService.deletePublicByFileMd5(fileMd5);
+                }
                 logger.info("重建前已清理 Elasticsearch 文档: {}", fileMd5);
             } catch (Exception e) {
                 logger.warn("重建前清理 Elasticsearch 失败: fileMd5={}, error={}", fileMd5, e.getMessage());
             }
 
             documentVectorRepository.deleteByFileMd5(fileMd5);
+            if (privateDocumentVectorRepository != null && fileUpload.isPrivateDocument()) {
+                privateDocumentVectorRepository.deleteByFileMd5AndUserId(fileMd5, fileUpload.getUserId());
+            }
             invalidatePdfSinglePagePreviewCache(fileMd5);
 
             parseService.parseAndSave(
@@ -214,7 +232,8 @@ public class DocumentService {
                     fileStream,
                     fileUpload.getUserId(),
                     fileUpload.getOrgTag(),
-                    fileUpload.isPublic()
+                    fileUpload.isPublic(),
+                    fileUpload.getDocumentTypeEnum()
             );
 
             VectorizationService.VectorizationUsageResult result = vectorizationService.vectorizeWithUsage(
@@ -222,7 +241,8 @@ public class DocumentService {
                     fileUpload.getUserId(),
                     fileUpload.getOrgTag(),
                     fileUpload.isPublic(),
-                    requesterId
+                    requesterId,
+                    fileUpload.getDocumentTypeEnum()
             );
             markVectorizationCompleted(fileUpload, result);
 
@@ -246,12 +266,17 @@ public class DocumentService {
 
     @Transactional
     public FileUpload enqueueAsyncVectorizationRetry(String fileMd5, String requesterId) {
+        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                .orElseThrow(() -> new RuntimeException("文件不存在"));
+        return enqueueAsyncVectorizationRetry(fileUpload, requesterId);
+    }
+
+    @Transactional
+    public FileUpload enqueueAsyncVectorizationRetry(FileUpload fileUpload, String requesterId) {
+        String fileMd5 = fileUpload.getFileMd5();
         if (isDocumentDeleted(fileMd5)) {
             throw new IllegalStateException("文件已被删除，无法重试向量化");
         }
-
-        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
-                .orElseThrow(() -> new RuntimeException("文件不存在"));
 
         markVectorizationProcessing(fileUpload, true);
 
@@ -263,7 +288,8 @@ public class DocumentService {
                 fileUpload.getOrgTag(),
                 fileUpload.isPublic(),
                 FileProcessingTask.TASK_TYPE_REINDEX,
-                requesterId
+                requesterId,
+                fileUpload.getDocumentType()
         );
 
         kafkaTemplate.executeInTransaction(kt -> {
@@ -271,8 +297,29 @@ public class DocumentService {
             return true;
         });
 
-        logger.info("已发送异步向量化重试任务: fileMd5={}, requesterId={}", fileMd5, requesterId);
+        logger.info("已发送异步向量化重试任务: fileMd5={}, requesterId={}, documentType={}",
+                fileMd5, requesterId, fileUpload.getDocumentType());
         return fileUpload;
+    }
+
+    /**
+     * 按 MD5 + 所有者 + 文档类型定位文件记录，供重试/重建索引使用。
+     */
+    public FileUpload findDocument(String fileMd5, String userId, com.yizhaoqi.rag.chunker.DocumentType documentType) {
+        if (userId == null || userId.isBlank()) {
+            return fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                    .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
+        }
+        if (documentType != null) {
+            Optional<FileUpload> typed = fileUploadRepository
+                    .findFirstByFileMd5AndUserIdAndDocumentTypeOrderByCreatedAtDesc(
+                            fileMd5, userId, documentType.name());
+            if (typed.isPresent()) {
+                return typed.get();
+            }
+        }
+        return fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
+                .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
     }
 
     @Transactional
@@ -367,7 +414,7 @@ public class DocumentService {
         }
     }
 
-    private void markVectorizationProcessing(FileUpload fileUpload, boolean resetActualUsage) {
+    public void markVectorizationProcessing(FileUpload fileUpload, boolean resetActualUsage) {
         fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_PROCESSING);
         fileUpload.setVectorizationErrorMessage(null);
         if (resetActualUsage) {
@@ -377,7 +424,7 @@ public class DocumentService {
         fileUploadRepository.save(fileUpload);
     }
 
-    private void markVectorizationCompleted(FileUpload fileUpload, VectorizationService.VectorizationUsageResult result) {
+    public void markVectorizationCompleted(FileUpload fileUpload, VectorizationService.VectorizationUsageResult result) {
         fileUpload.setActualEmbeddingTokens((long) result.actualEmbeddingTokens());
         fileUpload.setActualChunkCount(result.actualChunkCount());
         fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_COMPLETED);
@@ -391,7 +438,7 @@ public class DocumentService {
         fileUploadRepository.save(fileUpload);
     }
 
-    private void markVectorizationFailed(FileUpload fileUpload, Throwable error) {
+    public void markVectorizationFailed(FileUpload fileUpload, Throwable error) {
         markVectorizationFailed(fileUpload, resolveVectorizationErrorMessage(error));
     }
 
@@ -452,7 +499,7 @@ public class DocumentService {
             List<FileUpload> files;
             if (userEffectiveTags.isEmpty()) {
                 // 如果用户没有任何组织标签，只返回自己的文件和公开文件
-                files = fileUploadRepository.findByUserIdOrIsPublicTrue(userDbId);
+                files = fileUploadRepository.findOwnedOrPublicFiles(userDbId);
                 logger.debug("用户无组织标签，仅返回个人和公开文件");
             } else {
                 // 查询用户可访问的所有文件（考虑层级标签）
@@ -529,8 +576,11 @@ public class DocumentService {
                 changed = true;
             } else {
                 long vectorCount = vectorCountCache.computeIfAbsent(
-                        file.getFileMd5(),
-                        documentVectorRepository::countByFileMd5
+                        file.getFileMd5() + "|" + file.getUserId() + "|" + file.getDocumentType(),
+                        ignored -> documentVectorRepository.countByFileMd5(file.getFileMd5())
+                                + (privateDocumentVectorRepository == null
+                                        ? 0L : privateDocumentVectorRepository.countByFileMd5AndUserId(
+                                                file.getFileMd5(), file.getUserId()))
                 );
                 if (vectorCount > 0) {
                     file.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_COMPLETED);
@@ -556,51 +606,29 @@ public class DocumentService {
      * @return 预签名下载URL
      */
     public String generateDownloadUrl(String fileMd5) {
-        logger.info("生成文件下载链接: fileMd5={}", fileMd5);
-
         try {
-            // 从数据库获取文件信息
             FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
                     .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
-
-            // 优先使用新的MD5路径
-            String objectName = "merged/" + fileMd5;
-
-            try {
-                // 尝试使用新路径（MD5）
-                String presignedUrl = minioClient.getPresignedObjectUrl(
-                        GetPresignedObjectUrlArgs.builder()
-                                .method(Method.GET)
-                                .bucket("uploads")
-                                .object(objectName)
-                                .expiry(3600)
-                                .build()
-                );
-                logger.info("成功生成文件下载链接（新路径）: fileMd5={}, fileName={}, objectName={}",
-                        fileMd5, fileUpload.getFileName(), objectName);
-
-                // 使用 publicUrl 公开域名来替换原始域名
-                presignedUrl = uploadService.transToPublicUrl(presignedUrl);
-                return presignedUrl;
-            } catch (Exception e) {
-                logger.warn("使用新路径生成下载链接失败，尝试使用旧路径（文件名）: fileMd5={}", fileMd5);
-                // 降级：尝试使用旧的文件名路径（兼容旧数据）
-                String oldObjectName = "merged/" + fileUpload.getFileName();
-                String presignedUrl = minioClient.getPresignedObjectUrl(
-                        GetPresignedObjectUrlArgs.builder()
-                                .method(Method.GET)
-                                .bucket("uploads")
-                                .object(oldObjectName)
-                                .expiry(3600)
-                                .build()
-                );
-                logger.info("成功生成文件下载链接（旧路径）: fileMd5={}, fileName={}, objectName={}",
-                        fileMd5, fileUpload.getFileName(), oldObjectName);
-                presignedUrl = uploadService.transToPublicUrl(presignedUrl);
-                return presignedUrl;
-            }
+            return generateDownloadUrl(fileUpload);
         } catch (Exception e) {
             logger.error("生成文件下载链接失败: fileMd5={}", fileMd5, e);
+            return null;
+        }
+    }
+
+    /**
+     * 按文件记录生成下载链接，避免相同 MD5 的不同用户/文档类型之间串记录。
+     */
+    public String generateDownloadUrl(FileUpload fileUpload) {
+        try {
+            String presignedUrl = uploadService.generateMergedObjectUrl(fileUpload);
+            logger.info("成功生成文件下载链接: fileMd5={}, fileName={}, documentType={}, bucket={}",
+                    fileUpload.getFileMd5(), fileUpload.getFileName(), fileUpload.getDocumentType(),
+                    fileUpload.getStorageBucket());
+            return uploadService.transToPublicUrl(presignedUrl);
+        } catch (Exception e) {
+            logger.error("生成文件下载链接失败: fileMd5={}, documentType={}",
+                    fileUpload.getFileMd5(), fileUpload.getDocumentType(), e);
             return null;
         }
     }
@@ -613,19 +641,25 @@ public class DocumentService {
      * @return 文件预览内容，对于文本文件返回前几KB内容，非文本文件返回文件信息
      */
     public String getFilePreviewContent(String fileMd5, String fileName) {
-        logger.info("获取文件预览内容: fileMd5={}, fileName={}", fileMd5, fileName);
-
         try {
-            // 从数据库获取文件信息
             FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
                     .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
+            return getFilePreviewContent(fileUpload, fileName);
+        } catch (Exception e) {
+            logger.error("获取文件预览内容失败: fileMd5={}, fileName={}", fileMd5, fileName, e);
+            return "预览失败: " + e.getMessage();
+        }
+    }
 
-            // 判断文件类型
+    public String getFilePreviewContent(FileUpload fileUpload, String fileName) {
+        logger.info("获取文件预览内容: fileMd5={}, fileName={}, documentType={}",
+                fileUpload.getFileMd5(), fileName, fileUpload.getDocumentType());
+
+        try {
             String fileExtension = getFileExtension(fileName).toLowerCase();
             boolean isTextFile = isTextFile(fileExtension);
 
             if (isTextFile) {
-                // 对于文本文件，读取前10KB内容
                 try (InputStream inputStream = openFileStream(fileUpload);
                      BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, "UTF-8"))) {
                     StringBuilder content = new StringBuilder();
@@ -643,13 +677,13 @@ public class DocumentService {
                         result += "\n... (内容已截断，仅显示前10KB)";
                     }
 
-                    logger.info("成功获取文本文件预览内容: fileMd5={}, contentLength={}, 内容前50字符={}",
-                        fileMd5, result.length(), result.substring(0, Math.min(50, result.length())));
+                    logger.info("成功获取文本文件预览内容: fileMd5={}, contentLength={}",
+                            fileUpload.getFileMd5(), result.length());
                     return result;
                 }
-            } else {
-                // 对于非文本文件，返回文件信息
-                String fileInfo = String.format(
+            }
+
+            String fileInfo = String.format(
                     "文件名: %s\n" +
                     "文件大小: %s\n" +
                     "文件类型: %s\n" +
@@ -659,23 +693,33 @@ public class DocumentService {
                     formatFileSize(fileUpload.getTotalSize()),
                     fileExtension.toUpperCase(),
                     fileUpload.getCreatedAt()
-                );
-
-                logger.info("返回非文本文件信息: fileMd5={}", fileMd5);
-                return fileInfo;
-            }
-
+            );
+            logger.info("返回非文本文件信息: fileMd5={}", fileUpload.getFileMd5());
+            return fileInfo;
         } catch (Exception e) {
-            logger.error("获取文件预览内容失败: fileMd5={}, fileName={}", fileMd5, fileName, e);
+            logger.error("获取文件预览内容失败: fileMd5={}, fileName={}", fileUpload.getFileMd5(), fileName, e);
             return "预览失败: " + e.getMessage();
         }
     }
 
     public PdfSinglePagePreview getPdfSinglePagePreview(String fileMd5, int pageNumber) {
-        logger.info("生成 PDF 单页预览: fileMd5={}, pageNumber={}", fileMd5, pageNumber);
+        try {
+            FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                    .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
+            return getPdfSinglePagePreview(fileUpload, pageNumber);
+        } catch (Exception e) {
+            logger.error("生成 PDF 单页预览失败: fileMd5={}, pageNumber={}", fileMd5, pageNumber, e);
+            throw new RuntimeException("生成 PDF 单页预览失败: " + e.getMessage(), e);
+        }
+    }
+
+    public PdfSinglePagePreview getPdfSinglePagePreview(FileUpload fileUpload, int pageNumber) {
+        String fileMd5 = fileUpload.getFileMd5();
+        logger.info("生成 PDF 单页预览: fileMd5={}, pageNumber={}, documentType={}",
+                fileMd5, pageNumber, fileUpload.getDocumentType());
 
         try {
-            String cacheKey = buildPdfSinglePageCacheKey(fileMd5, pageNumber);
+            String cacheKey = buildPdfSinglePageCacheKey(fileUpload, pageNumber);
             byte[] localPreview = getLocalPdfSinglePagePreview(cacheKey);
             if (localPreview != null) {
                 logger.info("命中 PDF 单页预览本地缓存: fileMd5={}, pageNumber={}, previewSize={}",
@@ -690,9 +734,6 @@ public class DocumentService {
                         fileMd5, pageNumber, cachedPreview.length);
                 return new PdfSinglePagePreview(cachedPreview, true);
             }
-
-            FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
-                    .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
 
             try (InputStream inputStream = openFileStream(fileUpload);
                  PDDocument sourceDocument = PDDocument.load(inputStream);
@@ -732,32 +773,15 @@ public class DocumentService {
     }
 
     private InputStream openFileStream(FileUpload fileUpload) throws Exception {
-        String objectName = "merged/" + fileUpload.getFileMd5();
-
-        try {
-            InputStream inputStream = minioClient.getObject(
-                    GetObjectArgs.builder()
-                            .bucket("uploads")
-                            .object(objectName)
-                            .build());
-            logger.info("使用新路径（MD5）获取文件流: fileMd5={}, objectName={}", fileUpload.getFileMd5(), objectName);
-            return inputStream;
-        } catch (Exception e) {
-            logger.warn("使用新路径获取文件失败，尝试使用旧路径（文件名）: fileMd5={}, error={}",
-                    fileUpload.getFileMd5(), e.getMessage());
-            String oldObjectName = "merged/" + fileUpload.getFileName();
-            InputStream inputStream = minioClient.getObject(
-                    GetObjectArgs.builder()
-                            .bucket("uploads")
-                            .object(oldObjectName)
-                            .build());
-            logger.info("使用旧路径（文件名）获取文件流: fileMd5={}, objectName={}", fileUpload.getFileMd5(), oldObjectName);
-            return inputStream;
-        }
+        InputStream inputStream = uploadService.getMergedFileStream(fileUpload);
+        logger.info("获取文件流: fileMd5={}, documentType={}, bucket={}",
+                fileUpload.getFileMd5(), fileUpload.getDocumentType(), fileUpload.getStorageBucket());
+        return inputStream;
     }
 
-    private String buildPdfSinglePageCacheKey(String fileMd5, int pageNumber) {
-        return PDF_SINGLE_PAGE_CACHE_PREFIX + fileMd5 + ":" + pageNumber;
+    private String buildPdfSinglePageCacheKey(FileUpload fileUpload, int pageNumber) {
+        return PDF_SINGLE_PAGE_CACHE_PREFIX + fileUpload.getFileMd5() + ":"
+                + fileUpload.getDocumentTypeEnum().name() + ":" + pageNumber;
     }
 
     private byte[] getLocalPdfSinglePagePreview(String cacheKey) {

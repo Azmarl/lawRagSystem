@@ -57,10 +57,10 @@ public class EsIndexInitializer implements CommandLineRunner {
     @Override
     public void run(String... args) throws Exception {
         try {
-            logger.info("正在初始化索引 'knowledge_base'... endpoint={}://{}:{}, username={}",
+            logger.info("正在初始化索引 'knowledge_base' / 'knowledge_private'... endpoint={}://{}:{}, username={}",
                     scheme, host, port, maskUsername(username));
-            initializeIndex();
-                initializePrivateIndex();
+            initializeIndex("knowledge_base");
+            initializeIndex("knowledge_private");
         } catch (Exception exception) {
             // 特别处理连接关闭异常，尝试重新连接
             if (exception instanceof ConnectionClosedException || (exception.getCause() != null && exception.getCause() instanceof ConnectionClosedException)) {
@@ -68,7 +68,8 @@ public class EsIndexInitializer implements CommandLineRunner {
                 try {
                     Thread.sleep(5000); // 等待5秒后重试
                     // 重新尝试初始化索引
-                    initializeIndex();
+                    initializeIndex("knowledge_base");
+                    initializeIndex("knowledge_private");
                 } catch (Exception retryException) {
                     String diagnostic = buildDiagnosticMessage(retryException);
                     logger.error("重试初始化索引失败。{}", diagnostic, retryException);
@@ -87,20 +88,20 @@ public class EsIndexInitializer implements CommandLineRunner {
      * 如果索引不存在则创建；如果已存在则比较 _meta.version，
      * 仅当本地版本高于 ES 中版本时才更新 mapping。
      */
-    private void initializeIndex() throws Exception {
-        BooleanResponse existsResponse = esClient.indices().exists(ExistsRequest.of(e -> e.index("knowledge_base")));
+    private void initializeIndex(String indexName) throws Exception {
+        BooleanResponse existsResponse = esClient.indices().exists(ExistsRequest.of(e -> e.index(indexName)));
         if (!existsResponse.value()) {
-            createIndex();
+            createIndex(indexName);
         } else {
             int localVersion = getLocalMappingVersion();
-            int esVersion = getEsMappingVersion();
+            int esVersion = getEsMappingVersion(indexName);
             if (localVersion > esVersion) {
-                logger.info("索引 'knowledge_base' mapping 版本变更 (ES:{} → 本地:{})，执行增量更新...",
-                        esVersion, localVersion);
-                tryUpdateMapping();
+                logger.info("索引 '{}' mapping 版本变更 (ES:{} → 本地:{})，执行增量更新...",
+                        indexName, esVersion, localVersion);
+                tryUpdateMapping(indexName);
             } else {
-                logger.info("索引 'knowledge_base' mapping 已是最新版本 (ES:{}，本地:{})，跳过更新。",
-                        esVersion, localVersion);
+                logger.info("索引 '{}' mapping 已是最新版本 (ES:{}，本地:{})，跳过更新。",
+                        indexName, esVersion, localVersion);
             }
         }
     }
@@ -133,13 +134,13 @@ public class EsIndexInitializer implements CommandLineRunner {
     }
 
     /**
-     * 查询 ES 中 knowledge_base 索引的 _meta.version。
+     * 查询 ES 中指定索引的 _meta.version。
      * 若索引无 _meta 或未找到 version，则默认返回 0。
      */
-    private int getEsMappingVersion() {
+    private int getEsMappingVersion(String indexName) {
         try {
             GetMappingResponse response = esClient.indices()
-                    .getMapping(GetMappingRequest.of(g -> g.index("knowledge_base")));
+                    .getMapping(GetMappingRequest.of(g -> g.index(indexName)));
             var indexMappings = response.result();
             if (indexMappings.isEmpty()) return 0;
             // 取第一个索引的 mapping
@@ -161,7 +162,7 @@ public class EsIndexInitializer implements CommandLineRunner {
      * 尝试在已有索引上增量添加新字段的 mapping。
      * 使用 PutMapping API 仅添加新字段，不会影响已有字段或数据。
      */
-    private void tryUpdateMapping() {
+    private void tryUpdateMapping(String indexName) {
         try {
             String mappingJson;
             try (var inputStream = mappingResource.getInputStream()) {
@@ -182,20 +183,20 @@ public class EsIndexInitializer implements CommandLineRunner {
             String propertiesJson = mapper.writeValueAsString(Map.of("properties", properties));
 
             PutMappingRequest putMappingRequest = PutMappingRequest.of(p -> p
-                    .index("knowledge_base")
+                    .index(indexName)
                     .withJson(new StringReader(propertiesJson))
             );
 
             esClient.indices().putMapping(putMappingRequest);
-            logger.info("索引 'knowledge_base' mapping 更新成功（新增法律层级字段）");
+            logger.info("索引 '{}' mapping 更新成功（新增文档类型/案件段落字段）", indexName);
         } catch (Exception e) {
             String msg = safeMessage(e);
-            logger.warn("索引 'knowledge_base' mapping 增量更新失败: {}。" +
+            logger.warn("索引 '{}' mapping 增量更新失败: {}。" +
                             "如果是因为 mapping 参数冲突，请手动执行以下步骤清空 ES 数据卷后重启：" +
                             "\n  1. docker-compose -f data/docker-compose.yaml down -v" +
                             "\n  2. docker-compose -f data/docker-compose.yaml up -d" +
                             "\n  3. 重新上传文档",
-                    msg);
+                    indexName, msg);
         }
     }
 
@@ -203,7 +204,7 @@ public class EsIndexInitializer implements CommandLineRunner {
      * 创建索引
      * @throws Exception
      */
-    private void createIndex() throws Exception {
+    private void createIndex(String indexName) throws Exception {
         // 读取 JSON 文件内容，使用 InputStream 方式支持 JAR 包内资源
         String mappingJson;
         try (var inputStream = mappingResource.getInputStream()) {
@@ -211,27 +212,11 @@ public class EsIndexInitializer implements CommandLineRunner {
         }
         // 创建索引并应用映射
         CreateIndexRequest createIndexRequest = CreateIndexRequest.of(c -> c
-                .index("knowledge_base") // 索引名称
-                .withJson(new StringReader(mappingJson)) // 使用 JSON 文件定义映射
+                .index(indexName)
+                .withJson(new StringReader(mappingJson))
         );
         esClient.indices().create(createIndexRequest);
-        logger.info("索引 'knowledge_base' 已创建");
-    }
-
-    private void initializePrivateIndex() throws Exception {
-        BooleanResponse existsResponse = esClient.indices().exists(
-                ExistsRequest.of(e -> e.index("knowledge_private")));
-        if (existsResponse.value()) {
-            return;
-        }
-        String mappingJson;
-        try (var inputStream = mappingResource.getInputStream()) {
-            mappingJson = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
-        }
-        esClient.indices().create(CreateIndexRequest.of(c -> c
-                .index("knowledge_private")
-                .withJson(new StringReader(mappingJson))));
-        logger.info("索引 'knowledge_private' 已创建");
+        logger.info("索引 '{}' 已创建", indexName);
     }
 
     private String buildDiagnosticMessage(Exception exception) {
